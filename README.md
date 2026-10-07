@@ -35,7 +35,7 @@ The engineering problems are the ones that dominate RL post-training at scale:
 | M3 | Fast weight sync: relay's GPU weights updated in place instead of rebuilt | done: 0.017 s instead of 6.3 s on a T4 (369×) |
 | M4 | The long tail: partial rollouts that pause and resume across steps, and one-step-ahead asynchronous training | done: steps 49.1 s → 25.6 s on two T4s (1.9×) |
 | M5 | Qwen2.5-0.5B-Instruct on GSM8K on two T4s: both GPUs alternating rollout and training, against one generating while the other trains; accuracy before and after | done: GSM8K test accuracy 48.1% → 52.5% in 100 steps (colocated) |
-| M6 | Write-up | |
+| M6 | Write-up | done: this README, with raw results in `results/t4` |
 
 ## M0: relay from Python
 
