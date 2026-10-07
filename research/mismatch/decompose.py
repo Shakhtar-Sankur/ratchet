@@ -154,6 +154,12 @@ def main(argv=None):
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args(argv)
     args.weight_dtype = args.train_weights
+    if args.train_device.startswith("cuda") and torch.cuda.is_available():
+        want = torch.device(args.train_device).index or 0
+        if want >= torch.cuda.device_count():  # one GPU: the trainer goes beside relay
+            args.train_device = f"cuda:{args.relay_device}"
+    print(json.dumps({"gpus": torch.cuda.device_count() if torch.cuda.is_available() else 0,
+                      "relay_device": args.relay_device, "train_device": args.train_device}), flush=True)
 
     checkpoints = sorted(int(c) for c in args.checkpoints.split(","))
     tok = gsm8k.ChatTokenizer(args.model)

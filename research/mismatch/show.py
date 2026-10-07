@@ -7,7 +7,7 @@ for line in sys.stdin:
         r = json.loads(line)
     except ValueError:
         continue
-    if "experiment" in r:
+    if "experiment" in r or "gpus" in r:
         print(json.dumps(r), flush=True)
     elif "step" in r:
         if r["step"] in (1, 2, 3) or r["step"] % 5 == 0:
