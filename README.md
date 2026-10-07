@@ -34,7 +34,7 @@ The engineering problems are the ones that dominate RL post-training at scale:
 | M2 | GRPO: rewards, group-normalised advantages, clipped objective, AdamW; a toy task learned on CPU | done |
 | M3 | Fast weight sync: relay's GPU weights updated in place instead of rebuilt | done: 0.017 s instead of 6.3 s on a T4 (369×) |
 | M4 | The long tail: partial rollouts that pause and resume across steps, and one-step-ahead asynchronous training | done: steps 49.1 s → 25.6 s on two T4s (1.9×) |
-| M5 | Qwen2.5-0.5B-Instruct on GSM8K on two T4s: both GPUs alternating rollout and training, against one generating while the other trains; accuracy before and after | split mode done: 47.8% → 50.2% on GSM8K test; colocated rerun pending |
+| M5 | Qwen2.5-0.5B-Instruct on GSM8K on two T4s: both GPUs alternating rollout and training, against one generating while the other trains; accuracy before and after | done: GSM8K test accuracy 48.1% → 52.5% in 100 steps (colocated) |
 | M6 | Write-up | |
 
 ## M0: relay from Python
@@ -207,36 +207,40 @@ On the CPU, `tests/test_ddp.py` checks that the ranks stay identical (also when 
 has nothing to train) and still learn, and `tests/test_gsm8k_driver.py` runs every
 phase end to end on a tiny model.
 
-### Results (`results/t4/m5-full-2026-10-07.txt`)
+### Results
 
 Qwen2.5-0.5B-Instruct, 100 GRPO steps of 8 problems × 8 answers, learning rate 1e-6,
-answers up to 384 tokens; greedy accuracy on all 1,319 GSM8K test problems:
+answers up to 384 tokens; greedy accuracy on all 1,319 GSM8K test problems
+(`results/t4/m5-colocated-2026-10-07.txt`, `results/t4/m5-full-2026-10-07.txt`):
 
-| | Before | After 100 steps |
-|---|---|---|
-| Accuracy | 47.8% | **50.2%** (+2.4 points) |
-| Answers cut off at 512 tokens | 6% | 2% |
-| Mean answer length | 310 tokens | 242 tokens |
+| Mode | Before | After 100 steps | Cut off at 512 tokens | Mean answer | Time |
+|---|---|---|---|---|---|
+| colocated (tandem DDP, both GPUs generate then train) | 48.1% | **52.5%** (+4.4) | 6% → 2% | 311 → 246 tokens | 50.6 min |
+| split, one step ahead + partial rollouts | 47.8% | **50.2%** (+2.4) | 6% → 2% | 310 → 242 tokens | 44.7 min |
 
-Training reward (fraction of sampled answers correct) went from 0.38 over the first 10
-steps to 0.56 over the last 10. The same weights evaluated with a different batching of
-the test set gave 48.1% instead of 47.8%: fp16 results depend slightly on which
-sequences share a batch, so differences of a few tenths of a point are noise.
+Training reward (fraction of sampled answers correct) rose from 0.44 to 0.58 (colocated,
+first vs last 10 steps) and from 0.38 to 0.56 (split). One run per mode, so the
+difference between the two gains is not established: the split mode trains on answers
+sampled one update earlier, but different sampling seeds alone could account for it.
+The same weights gave 48.1% and 47.8% under two batchings of the test set (fp16 results
+depend slightly on which sequences share a batch), so a few tenths of a point is noise.
+The trained model also stopped writing "####" before its answer (32% → 0% in the
+colocated run) and uses `\boxed{}`, which the reward accepts as well.
 
-Time per step, two T4s, GPU 1 generating and GPU 0 training (median over the run):
+Time per step, two T4s (median over the run; every mode trains 8 groups per step):
 
-| Split mode | Step | Generate | Train | Weight sync |
+| Mode | Step | Generate | Train | Weight sync |
 |---|---|---|---|---|
-| synchronous: generate, then train | 49.1 s | 23.5 s | 25.1 s | 0.40 s |
-| one step ahead + partial rollouts | **25.6 s** | 20.7 s (overlapped) | 25.2 s | 0.40 s |
+| split, synchronous: GPU 1 generates, then GPU 0 trains | 49.1 s | 23.5 s | 25.1 s | 0.40 s (peer copy) |
+| split, one step ahead + partial rollouts | **25.6 s** | 20.7 s (overlapped) | 25.2 s | 0.40 s |
+| colocated: each GPU generates half, then trains on half | 30.1 s | 13.5 s | 16.6 s | 0.19 s |
 
-Generating batch k+1 while batch k trains hides generation behind training, so a step
-costs about the training time alone: 1.9× faster for the same 8 groups per step. Partial
-rollouts (12 groups in flight, 8 trained per step) trim generation a little more, but here
-training is the longer half. Relay sampled from exactly the trainer's policy throughout
-(fresh samples: gap at most 0.04 on every step of the synchronous run, 0 tokens with a
-ratio outside 1 ± 0.2). The colocated mode (both GPUs alternate) ran out of memory on step 3
-and is being rerun after a fix (the LM head in chunks of 512 positions).
+Generating batch k+1 while batch k trains hides generation behind training, so a split
+step costs about the training time alone: 1.9× faster than the synchronous split for the
+same work. Colocated halves both generation and training per GPU but runs them one after
+the other, and adds tandem's gradient all-reduce. In every mode relay sampled from
+exactly the trainer's policy: on fresh samples the largest relay/trainer gap per step was
+0.02 to 0.05 throughout, with no token's ratio outside 1 ± 0.2.
 
 ### What the first GPU runs found
 
@@ -267,7 +271,11 @@ that the CPU tests could not:
   | fp16-rounded weights (now) | **0.043** | **0.00067** | **0.0078** | **0** |
 
   With the fix the gap after training is what it was at the released weights (0.041), in
-  every mode: colocated and split runs report a per-step maximum of 0.03 to 0.06.
+  every mode: colocated and split runs report a per-step maximum of 0.02 to 0.06.
+- **Colocated ran out of memory.** With relay and the trainer on one 15 GB T4, the
+  logits of every response token at once (and their gradient), about 0.9 GB each for
+  four 384-token answers and a 151,936-token vocabulary, did not fit. The trainer now
+  applies the LM head 512 positions at a time, each chunk recomputed in backward.
 
 ## Build and test
 
