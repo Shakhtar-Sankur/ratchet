@@ -98,3 +98,25 @@ def test_the_fast_sync_gives_the_same_run_as_a_reload():
         ma, mb = a.step(prompts(s)), b.step(prompts(s))
         assert [x.tokens for x in ma["samples"]] == [x.tokens for x in mb["samples"]]
         assert [x.logprobs for x in ma["samples"]] == [x.logprobs for x in mb["samples"]]
+
+
+def test_a_batch_reward_function_gives_the_same_run():
+    """reward_fn.batch (one call per step, e.g. graded in parallel) is the per-sample
+    reward_fn applied to each sample, so the run is the same."""
+    a, b = make(), make()
+    per_sample = b.reward_fn
+    calls = []
+
+    class Batched:
+        def __call__(self, s, answer):
+            raise AssertionError("batch should be used")
+
+        def batch(self, samples):
+            calls.append(len(samples))
+            return [per_sample(s, s.answer) for s in samples]
+
+    b.reward_fn = Batched()
+    for s in range(3):
+        ma, mb = a.step(prompts(s)), b.step(prompts(s))
+        assert ma["reward"] == mb["reward"] and ma["loss"] == mb["loss"]
+    assert calls == [len(ma["samples"])] * 3

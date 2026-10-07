@@ -3,7 +3,8 @@
 One step:
   1. rollout: every prompt is sampled group_size times on relay's engine, which also
      reports the log-probability of each sampled token;
-  2. reward: reward_fn scores each response;
+  2. reward: reward_fn scores each response (reward_fn.batch, if it has one, scores them all
+     in one call);
   3. advantage: within a group, (reward - mean) / std, so a response is pushed up or
      down relative to the other answers to the same prompt (no value network);
   4. update: the PPO clipped objective, averaged over all response tokens, for
@@ -192,8 +193,10 @@ class GRPO:
         """Rewards, advantages and one update from finished groups. Touches only the
         policy, not relay, so it can run while relay generates the next batch."""
         cfg = self.cfg
-        for s in samples:
-            s.reward = float(self.reward_fn(s, s.answer))
+        batch = getattr(self.reward_fn, "batch", None)   # scores a whole step at once (e.g. in parallel)
+        rewards = batch(samples) if batch is not None else [self.reward_fn(s, s.answer) for s in samples]
+        for s, r in zip(samples, rewards):
+            s.reward = float(r)
         if samples:
             adv = group_advantages([s.reward for s in samples], cfg.group_size, cfg.scale_by_std)
             for s, a in zip(samples, adv.tolist()):
