@@ -33,8 +33,8 @@ The engineering problems are the ones that dominate RL post-training at scale:
 | M1 | The trainer's policy in PyTorch, in relay's fused weight layout so a sync is a copy; its log-probabilities checked against relay's rollouts | done (CPU; GPU gap measured in M5) |
 | M2 | GRPO: rewards, group-normalised advantages, clipped objective, AdamW; a toy task learned on CPU | done |
 | M3 | Fast weight sync: relay's GPU weights updated in place instead of rebuilt | done: 0.017 s instead of 6.3 s on a T4 (369×) |
-| M4 | The long tail: partial rollouts that pause and resume across steps, and one-step-ahead asynchronous training | built and checked on CPU; GPU timing in M5 |
-| M5 | Qwen2.5-0.5B-Instruct on GSM8K on two T4s: both GPUs alternating rollout and training, against one generating while the other trains; accuracy before and after | smoke run done (every phase); full run next |
+| M4 | The long tail: partial rollouts that pause and resume across steps, and one-step-ahead asynchronous training | done: steps 49.1 s → 25.6 s on two T4s (1.9×) |
+| M5 | Qwen2.5-0.5B-Instruct on GSM8K on two T4s: both GPUs alternating rollout and training, against one generating while the other trains; accuracy before and after | split mode done: 47.8% → 50.2% on GSM8K test; colocated rerun pending |
 | M6 | Write-up | |
 
 ## M0: relay from Python
@@ -188,7 +188,7 @@ GPUs in M5. (With learning on, the toy reward teaches the model to avoid the
 end-of-sequence token, so every answer reaches the length limit and there is no tail
 left to cut.)
 
-## M5: GSM8K on two T4s (smoke run done; full run next)
+## M5: GSM8K on two T4s
 
 `ratchet/gsm8k.py` runs the experiment on Qwen2.5-0.5B-Instruct and `scripts/kaggle_m5.sh`
 runs it on a Kaggle notebook with two T4s:
@@ -206,6 +206,37 @@ Both training modes evaluate greedy accuracy on the GSM8K test set before and af
 On the CPU, `tests/test_ddp.py` checks that the ranks stay identical (also when one
 has nothing to train) and still learn, and `tests/test_gsm8k_driver.py` runs every
 phase end to end on a tiny model.
+
+### Results (`results/t4/m5-full-2026-10-07.txt`)
+
+Qwen2.5-0.5B-Instruct, 100 GRPO steps of 8 problems × 8 answers, learning rate 1e-6,
+answers up to 384 tokens; greedy accuracy on all 1,319 GSM8K test problems:
+
+| | Before | After 100 steps |
+|---|---|---|
+| Accuracy | 47.8% | **50.2%** (+2.4 points) |
+| Answers cut off at 512 tokens | 6% | 2% |
+| Mean answer length | 310 tokens | 242 tokens |
+
+Training reward (fraction of sampled answers correct) went from 0.38 over the first 10
+steps to 0.56 over the last 10. The same weights evaluated with a different batching of
+the test set gave 48.1% instead of 47.8%: fp16 results depend slightly on which
+sequences share a batch, so differences of a few tenths of a point are noise.
+
+Time per step, two T4s, GPU 1 generating and GPU 0 training (median over the run):
+
+| Split mode | Step | Generate | Train | Weight sync |
+|---|---|---|---|---|
+| synchronous: generate, then train | 49.1 s | 23.5 s | 25.1 s | 0.40 s |
+| one step ahead + partial rollouts | **25.6 s** | 20.7 s (overlapped) | 25.2 s | 0.40 s |
+
+Generating batch k+1 while batch k trains hides generation behind training, so a step
+costs about the training time alone: 1.9× faster for the same 8 groups per step. Partial
+rollouts (12 groups in flight, 8 trained per step) trim generation a little more, but here
+training is the longer half. Relay sampled from exactly the trainer's policy throughout
+(fresh samples: gap at most 0.04 on every step of the synchronous run, 0 tokens with a
+ratio outside 1 ± 0.2). The colocated mode (both GPUs alternate) ran out of memory on step 3
+and is being rerun after a fix (the LM head in chunks of 512 positions).
 
 ### What the first GPU runs found
 
