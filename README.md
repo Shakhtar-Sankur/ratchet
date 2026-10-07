@@ -31,7 +31,7 @@ The engineering problems are the ones that dominate RL post-training at scale:
 |---|---|---|
 | M0 | relay from Python: a C interface (`relay/c_api.h`, `librelay_c`) to load a model, write its weights, and generate rollouts with per-token log-probabilities; resume unfinished rollouts | done |
 | M1 | The trainer's policy in PyTorch, in relay's fused weight layout so a sync is a copy; its log-probabilities checked against relay's rollouts | done (CPU; GPU gap measured in M5) |
-| M2 | GRPO: rewards, group-normalised advantages, clipped objective, AdamW; a toy task learned on CPU | |
+| M2 | GRPO: rewards, group-normalised advantages, clipped objective, AdamW; a toy task learned on CPU | done |
 | M3 | Fast weight sync: relay's GPU weights updated in place instead of rebuilt | |
 | M4 | The long tail: partial rollouts that pause and resume across steps, and one-step-ahead asynchronous training | |
 | M5 | Qwen2.5-0.5B-Instruct on GSM8K on two T4s: both GPUs alternating rollout and training, against one generating while the other trains; accuracy before and after | |
@@ -83,6 +83,32 @@ Both run float32 on the CPU; what is left is relay storing each log-probability 
 float. The tests also update the policy, sync it into relay, and check the agreement
 again on new rollouts, so a sync that missed a tensor would fail. On a GPU relay runs
 in fp16 while the trainer stays fp32; that gap is not zero, and M5 measures it.
+
+## M2: GRPO
+
+`ratchet/grpo.py` runs one step as: rollout on relay (every prompt sampled
+`group_size` times) → reward → advantage within each group, (r − mean) / std (or
+unscaled, as in Dr. GRPO) → PPO clipped objective averaged over all response tokens,
+in micro-batches → AdamW → weights synced into relay. Groups whose answers all scored
+the same have zero advantage and are skipped.
+
+The importance ratio's "old" log-probabilities are the trainer's, recomputed before
+the update (`old_logprobs="trainer"`, the common choice), or relay's own from sampling
+time (`"rollout"`), which also corrects for any gap between the two engines. Every
+step records that gap.
+
+Checked on the CPU (`tests/test_grpo.py`):
+
+- the maths: at ratio 1 the gradient is −A·∇log p for every token; clipping stops the
+  gradient exactly in the two cases PPO intends and not in the other two;
+- a tiny model (chat-tiny, random weights) learns a toy task with both choices: reward
+  (fraction of generated tokens from a quarter of the vocabulary) 0.24 over the first
+  5 steps, 1.0 over steps 26-30, at least 0.9 from step 17;
+- relay and the trainer agree throughout a run (gap below 1e-5 at every step);
+- a whole run is reproducible bit for bit: same rollouts, losses and final weights.
+
+`ratchet/tasks.py` has the GSM8K prompt and reward: 1 if the number after the last
+`####` (else `\boxed{}`, "answer is", or the last number) equals the reference.
 
 ## Build and test
 
