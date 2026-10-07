@@ -165,6 +165,23 @@ class Policy(nn.Module):
             cols += range(n - 1, n - 1 + len(r))  # position t predicts token t + 1
             targets += list(r)
         h = hidden[torch.tensor(rows, device=device), torch.tensor(cols, device=device)]
-        lg = F.linear(h, self.head()) / temperature
-        lp = lg.gather(1, torch.tensor(targets, device=device)[:, None])[:, 0] - torch.logsumexp(lg, dim=-1)
+        t = torch.tensor(targets, device=device)
+        # The LM head a chunk of positions at a time: the logits of every response token at
+        # once (and their gradient) would take vocab x tokens x 4 bytes, about 0.9 GB for
+        # four 384-token answers with Qwen's 151,936-token vocabulary. With gradients, each
+        # chunk is recomputed in backward instead of keeping its logits.
+        parts = []
+        for k in range(0, h.shape[0], self.logit_chunk):
+            args = (h[k:k + self.logit_chunk], t[k:k + self.logit_chunk], temperature)
+            if torch.is_grad_enabled():
+                parts.append(torch.utils.checkpoint.checkpoint(self._head_logprobs, *args, use_reentrant=False))
+            else:
+                parts.append(self._head_logprobs(*args))
+        lp = torch.cat(parts) if parts else h.new_zeros(0)
         return list(lp.split([len(r) for r in responses]))
+
+    logit_chunk = 512  # response positions per LM-head chunk
+
+    def _head_logprobs(self, h, targets, temperature):
+        lg = F.linear(h, self.head()) / temperature
+        return lg.gather(1, targets[:, None])[:, 0] - torch.logsumexp(lg, dim=-1)

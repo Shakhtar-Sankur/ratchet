@@ -3,6 +3,7 @@
 #   RUN=smoke (default): every phase for a few steps on 64 test problems, ~20 minutes;
 #                        finds problems before the long run.
 #   RUN=full:            the measurements, ~2-3 hours; use "Save Version -> Save & Run All".
+#   RUN=colocated:       only the colocated phase of the full run (100 steps), ~1.2 hours.
 # Paste everything from "== ratchet M5" to the end back into the chat.
 set -e
 RUN=${RUN:-smoke}
@@ -36,20 +37,24 @@ export PYTHONPATH=$PWD
 mkdir -p runs
 G="python -m ratchet.gsm8k"
 COMMON="--model models/qwen --data data"
-if [ "$RUN" = full ]; then
+if [ "$RUN" = full ] || [ "$RUN" = colocated ]; then
   STEPS=100; EVAL=""; TSTEPS=20
 else
   STEPS=3; EVAL="--eval-limit 64"; TSTEPS=3
 fi
 
+if [ "$RUN" != colocated ]; then
 echo "== check: fp16 vs fp32 log-probabilities, weight sync, answer lengths (GPU 0)"
 $G check $COMMON --out runs/check.jsonl
+fi
 echo "== colocated: tandem DDP over both GPUs, each generates then trains ($STEPS steps)"
 $G colocated $COMMON --steps $STEPS $EVAL --out runs/colocated.jsonl | tail -n 3
+if [ "$RUN" != colocated ]; then
 echo "== split, synchronous: GPU 1 generates, then GPU 0 trains ($TSTEPS steps, timing only)"
 $G split $COMMON --train-device cuda:0 --relay-device 1 --steps $TSTEPS --skip-eval --out runs/split_sync.jsonl | tail -n 1
 echo "== split, one step ahead + partial rollouts ($STEPS steps)"
 $G split $COMMON --train-device cuda:0 --relay-device 1 --steps $STEPS --ahead --partial $EVAL --out runs/split_async.jsonl | tail -n 3
+fi
 echo "== summary"
 python scripts/summarize.py runs
 echo "== done: copy from '== ratchet M5' to here and send it back"

@@ -153,3 +153,17 @@ def test_fp16_weights_are_relays_weights_with_straight_through_gradients():
         assert torch.equal(a.logits(torch.tensor([[1, 2, 3]])), b.logits(torch.tensor([[1, 2, 3]])))
     for (n, x), y in zip(a.named_parameters(), b.parameters()):
         assert torch.equal(x.grad, y.grad), n
+
+
+def test_the_lm_head_in_chunks_gives_the_same_logprobs_and_gradients():
+    _, a = load("qwen2-bias")
+    _, b = load("qwen2-bias")
+    b.logit_chunk = 3  # several chunks, the last one partial
+    prompts, responses = [[1, 2, 3], [4, 5]], [[6, 7, 8, 9], [10, 11, 12]]
+    la, lb = a.token_logprobs(prompts, responses), b.token_logprobs(prompts, responses)
+    for x, y in zip(la, lb):
+        assert torch.allclose(x, y, atol=1e-6)
+    torch.cat(la).sum().backward()
+    torch.cat(lb).sum().backward()
+    for (n, x), y in zip(a.named_parameters(), b.parameters()):
+        assert torch.allclose(x.grad, y.grad, atol=1e-6, rtol=1e-5), n
