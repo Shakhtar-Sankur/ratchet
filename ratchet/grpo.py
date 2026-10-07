@@ -39,6 +39,7 @@ class GRPOConfig:
     max_grad_norm: float = 1.0
     old_logprobs: str = "trainer"   # or "rollout"
     skip_zero_advantage: bool = True  # groups whose answers all scored the same teach nothing
+    sync: str = "push"              # "push": update relay's backend in place; "reload": host copy + rebuild
     seed: int = 0
 
 
@@ -122,8 +123,11 @@ class GRPO:
         t_train = time.perf_counter() - t1
 
         t2 = time.perf_counter()
-        self.policy.sync_to(self.model)
-        self.engine.reload_weights()
+        if cfg.sync == "push":
+            self.policy.push_to(self.engine)
+        else:
+            self.policy.sync_to(self.model)
+            self.engine.reload_weights()
         t_sync = time.perf_counter() - t2
         self.steps += 1
 

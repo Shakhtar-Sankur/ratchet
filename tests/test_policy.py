@@ -93,3 +93,31 @@ def test_gradients_flow_to_every_parameter():
     torch.cat(lp).sum().backward()
     for name, p in policy.named_parameters():
         assert p.grad is not None and p.grad.abs().sum() > 0, name
+
+
+def test_push_to_equals_sync_and_reload():
+    model_a, policy = load("qwen2-bias")
+    model_b, _ = load("qwen2-bias")
+    with torch.no_grad():
+        for p in policy.parameters():
+            p.mul_(1.1).add_(0.01)
+    ea, eb = relay.Engine(model_a), relay.Engine(model_b)
+    policy.push_to(ea)
+    policy.sync_to(model_b)
+    eb.reload_weights()
+    for e in (ea, eb):
+        e.add(1, [3, 4, 5, 6], max_new_tokens=10, seed=3, ignore_eos=True)
+    a, b = ea.run()[1], eb.run()[1]
+    assert a.tokens == b.tokens and a.logprobs == b.logprobs
+
+
+def test_update_tensor_rejects_bad_input():
+    model, policy = load("qwen2-bias")
+    e = relay.Engine(model)
+    with pytest.raises(relay.RelayError, match="wrong size"):
+        e.update_tensor("final_norm", torch.zeros(3))
+    with pytest.raises(relay.RelayError, match="float32"):
+        e.update_tensor("final_norm", torch.zeros(model.config.hidden, dtype=torch.float64))
+    e.add(1, [1, 2], max_new_tokens=3)
+    with pytest.raises(relay.RelayError, match="in flight"):
+        e.update_tensor("final_norm", torch.zeros(model.config.hidden))

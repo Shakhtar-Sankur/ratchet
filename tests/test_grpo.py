@@ -89,3 +89,12 @@ def test_a_run_is_reproducible_bit_for_bit():
         assert [x.tokens for x in ma["samples"]] == [x.tokens for x in mb["samples"]]
     for (n, p), q in zip(a.policy.named_parameters(), b.policy.parameters()):
         assert torch.equal(p, q), n
+
+
+def test_the_fast_sync_gives_the_same_run_as_a_reload():
+    a, b = make(), make()
+    a.cfg.sync, b.cfg.sync = "push", "reload"
+    for s in range(4):
+        ma, mb = a.step(prompts(s)), b.step(prompts(s))
+        assert [x.tokens for x in ma["samples"]] == [x.tokens for x in mb["samples"]]
+        assert [x.logprobs for x in ma["samples"]] == [x.logprobs for x in mb["samples"]]

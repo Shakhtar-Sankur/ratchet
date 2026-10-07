@@ -32,7 +32,7 @@ The engineering problems are the ones that dominate RL post-training at scale:
 | M0 | relay from Python: a C interface (`relay/c_api.h`, `librelay_c`) to load a model, write its weights, and generate rollouts with per-token log-probabilities; resume unfinished rollouts | done |
 | M1 | The trainer's policy in PyTorch, in relay's fused weight layout so a sync is a copy; its log-probabilities checked against relay's rollouts | done (CPU; GPU gap measured in M5) |
 | M2 | GRPO: rewards, group-normalised advantages, clipped objective, AdamW; a toy task learned on CPU | done |
-| M3 | Fast weight sync: relay's GPU weights updated in place instead of rebuilt | |
+| M3 | Fast weight sync: relay's GPU weights updated in place instead of rebuilt | built and checked on CPU; GPU timing in M5 |
 | M4 | The long tail: partial rollouts that pause and resume across steps, and one-step-ahead asynchronous training | |
 | M5 | Qwen2.5-0.5B-Instruct on GSM8K on two T4s: both GPUs alternating rollout and training, against one generating while the other trains; accuracy before and after | |
 | M6 | Write-up | |
@@ -109,6 +109,26 @@ Checked on the CPU (`tests/test_grpo.py`):
 
 `ratchet/tasks.py` has the GSM8K prompt and reward: 1 if the number after the last
 `####` (else `\boxed{}`, "answer is", or the last number) equals the reference.
+
+## M3: fast weight sync
+
+The simple sync copies every parameter to the host (`Policy.sync_to`) and rebuilds
+relay's backend (`Engine.reload_weights`): for a GPU trainer that is a device-to-host
+copy of all the weights, a host-side fp16 conversion and a fresh upload with new
+allocations. `Policy.push_to(engine)` instead hands relay each parameter's device
+pointer (`relay_engine_update_tensor`): relay converts fp32 to fp16 on its own GPU, in
+place, with round to nearest even, the same bits the host upload produces. If the
+trainer is on another GPU, relay pulls the tensor with a peer copy through a 64 MB
+staging buffer. `relay_engine_finish_update` then drops the prefix cache, whose KV
+entries were computed with the old weights.
+
+Two details that would otherwise break silently: after an on-GPU update the relay
+model's host copy is older than the GPU's, so a later full reload is refused instead
+of quietly reverting the policy; and updates are refused while a rollout is running.
+
+On the CPU, a GRPO run with `sync="push"` is identical, token for token and
+log-probability for log-probability, to one with `sync="reload"`. The GPU time saved
+is measured in M5.
 
 ## Build and test
 

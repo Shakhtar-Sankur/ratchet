@@ -84,6 +84,8 @@ def lib():
             "relay_engine_cancel_all": (None, [P]),
             "relay_engine_reload_weights": (I, [P]),
             "relay_engine_stats": (I, [P, ctypes.POINTER(_Stats)]),
+            "relay_engine_update_tensor": (I, [P, ctypes.c_char_p, P, ctypes.c_int64]),
+            "relay_engine_finish_update": (I, [P]),
         }
         for name, (res, args) in sig.items():
             f = getattr(L, name)
@@ -96,6 +98,12 @@ def _check(rc):
     if rc == -1 or rc is None:
         raise RelayError(lib().relay_last_error().decode())
     return rc
+
+
+def _torch_float32():
+    import torch
+
+    return torch.float32
 
 
 def cuda_available():
@@ -192,6 +200,7 @@ class Engine:
     def __init__(self, model, backend="cpu", device=0, num_blocks=256, block_size=16, max_batch_tokens=512,
                  max_seqs=64, prefix_caching=True):
         self.model = model
+        self.backend = backend
         self.max_seqs = max_seqs
         self._h = lib().relay_engine_new(model._h, backend.encode(), device, num_blocks, block_size,
                                          max_batch_tokens, max_seqs, int(prefix_caching))
@@ -232,6 +241,26 @@ class Engine:
     def reload_weights(self):
         """Use the model's current host weights (after a trainer wrote them); drops the prefix cache."""
         _check(lib().relay_engine_reload_weights(self._h))
+
+    def update_tensor(self, name, data):
+        """The fast weight sync: overwrites one of the backend's weights from a contiguous
+        float32 torch tensor (on the CUDA backend it may live on any GPU and is converted
+        to fp16 there) or numpy array. Call finish_update() after the last one."""
+        if hasattr(data, "data_ptr"):  # torch
+            if data.dtype != _torch_float32() or not data.is_contiguous():
+                raise RelayError(f"{name}: needs a contiguous float32 tensor")
+            if self.backend == "cpu" and data.is_cuda:
+                raise RelayError(f"{name}: the CPU backend needs host memory")
+            ptr, n = data.data_ptr(), data.numel()
+        else:
+            if data.dtype != np.float32 or not data.flags["C_CONTIGUOUS"]:
+                raise RelayError(f"{name}: needs a contiguous float32 array")
+            ptr, n = data.ctypes.data, data.size
+        _check(lib().relay_engine_update_tensor(self._h, name.encode(), ctypes.c_void_p(ptr), n))
+
+    def finish_update(self):
+        """Ends a weight update: drops the prefix cache (its KV entries used the old weights)."""
+        _check(lib().relay_engine_finish_update(self._h))
 
     def stats(self):
         s = _Stats()

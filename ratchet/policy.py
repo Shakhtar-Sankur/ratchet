@@ -59,6 +59,19 @@ class Policy(nn.Module):
             for name, param in self.named_parameters():
                 model.tensor(name)[:] = param.detach().reshape(-1).to("cpu", torch.float32).numpy()
 
+    def push_to(self, engine):
+        """The fast sync: every parameter straight into the engine's backend. With the
+        policy on a GPU and relay's CUDA backend, the copy stays on the GPU (fp32 to fp16
+        on the device, a peer copy if they are on different GPUs); the relay model's host
+        copy is not updated. On the CPU backend it writes the host weights."""
+        with torch.no_grad():
+            for name, param in self.named_parameters():
+                t = param.detach()
+                if engine.backend == "cpu" and t.is_cuda:
+                    t = t.cpu()
+                engine.update_tensor(name, t.to(torch.float32).contiguous())
+        engine.finish_update()
+
     def _rope(self, x, positions):
         # x [B, H, T, D]: pairs (i, i + D/2) rotated by position * inv_freq[i] (rotate_half).
         angle = positions.to(torch.float32)[:, None] * self.inv_freq[None, :]  # [T, D/2]
