@@ -33,7 +33,7 @@ The engineering problems are the ones that dominate RL post-training at scale:
 | M1 | The trainer's policy in PyTorch, in relay's fused weight layout so a sync is a copy; its log-probabilities checked against relay's rollouts | done (CPU; GPU gap measured in M5) |
 | M2 | GRPO: rewards, group-normalised advantages, clipped objective, AdamW; a toy task learned on CPU | done |
 | M3 | Fast weight sync: relay's GPU weights updated in place instead of rebuilt | built and checked on CPU; GPU timing in M5 |
-| M4 | The long tail: partial rollouts that pause and resume across steps, and one-step-ahead asynchronous training | |
+| M4 | The long tail: partial rollouts that pause and resume across steps, and one-step-ahead asynchronous training | built and checked on CPU; GPU timing in M5 |
 | M5 | Qwen2.5-0.5B-Instruct on GSM8K on two T4s: both GPUs alternating rollout and training, against one generating while the other trains; accuracy before and after | |
 | M6 | Write-up | |
 
@@ -129,6 +129,53 @@ of quietly reverting the policy; and updates are refused while a rollout is runn
 On the CPU, a GRPO run with `sync="push"` is identical, token for token and
 log-probability for log-probability, to one with `sync="reload"`. The GPU time saved
 is measured in M5.
+
+## M4: the long tail
+
+A step waits for its longest answer, and decoding one sequence is almost as slow as
+decoding a full batch. Two remedies, both in `ratchet/grpo.py`:
+
+- **Partial rollouts** (`partial=True`): keep more groups generating
+  (`groups_in_flight`) than a step trains on (`groups_per_step`). The step ends as soon
+  as enough groups have finished; the unfinished answers are cancelled with their
+  tokens kept, and resume next step under the new weights from exactly where they
+  stopped (relay's `add_resume`, same seed, next token index). Groups older than
+  `max_staleness` steps are dropped.
+- **One step ahead** (`run_async`): batch k+1 is generated on relay while batch k
+  trains; the new weights are synced once both are done.
+
+Both train on tokens sampled by an older policy, so for those tokens the importance
+ratio always uses relay's sampling-time log-probabilities (the behaviour policy's),
+never the trainer's at the current weights.
+
+Checked on the CPU (`tests/test_longtail.py`, a model whose answer lengths are
+long-tailed: median 5 tokens, 90th percentile 23, longest 48):
+
+- with the weights held fixed, groups finished across several steps are identical,
+  token for token and log-probability for log-probability, to the same groups
+  generated in one go; so is the one-step-ahead run to the synchronous one;
+- every partial step trains exactly 4 groups while others carry over, and over 6
+  steps the engine runs far fewer forward passes for the same number of groups;
+- staleness limits drop old groups; both remedies still learn the toy task.
+
+`scripts/longtail_cpu.py`, 20 steps, 4 groups of 8 trained per step:
+
+| Weights fixed (lr 0) | engine passes per trained group | time per step |
+|---|---|---|
+| synchronous | 11.0 | 64.5 ms |
+| partial (6 in flight, 4 per step) | **5.5** | 71.0 ms |
+| one step ahead | 11.0 | 131.7 ms |
+| partial + one step ahead | 5.5 | 110.6 ms |
+
+Partial rollouts halve the decode passes per trained group, but on a CPU that does
+not save time: each pass then carries more sequences, and a CPU pays for every
+sequence in a pass. On a GPU, decoding is limited by reading the weights, so a fuller
+pass costs about the same as an emptier one; that is where the saving should show.
+One step ahead is slower here because generation and training share the same 4 cores;
+it is meant for two GPUs, one generating while the other trains. Both are measured on
+GPUs in M5. (With learning on, the toy reward teaches the model to avoid the
+end-of-sequence token, so every answer reaches the length limit and there is no tail
+left to cut.)
 
 ## Build and test
 
