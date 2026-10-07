@@ -30,7 +30,9 @@ for split in ("train", "test"):
     print("gsm8k", split, len(ds))
 PY
 
-export PYTHONPATH=$PWD PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+# No expandable_segments: sharing such memory between processes needs pidfd_getfd, which
+# Kaggle's container forbids (tandem passes CUDA tensors between its ranks).
+export PYTHONPATH=$PWD
 mkdir -p runs
 G="python -m ratchet.gsm8k"
 COMMON="--model models/qwen --data data"
