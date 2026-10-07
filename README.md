@@ -177,6 +177,25 @@ GPUs in M5. (With learning on, the toy reward teaches the model to avoid the
 end-of-sequence token, so every answer reaches the length limit and there is no tail
 left to cut.)
 
+## M5: GSM8K on two T4s (code ready; run pending)
+
+`ratchet/gsm8k.py` runs the experiment on Qwen2.5-0.5B-Instruct and `scripts/kaggle_m5.sh`
+runs it on a Kaggle notebook with two T4s:
+
+- `check` (one GPU): the gap between relay's fp16 log-probabilities and the fp32
+  trainer's on real rollouts; reload against push weight sync, timed, and whether they
+  give identical rollouts; the answer-length distribution.
+- `colocated`: tandem DDP over both GPUs; each GPU generates half the groups on its own
+  relay engine, then trains on them, with gradients averaged by tandem's ring
+  all-reduce.
+- `split`: GPU 1 generates while GPU 0 trains, with one-step-ahead training and partial
+  rollouts, the weights pushed from GPU 0 to GPU 1 with relay's peer copy.
+
+Both training modes evaluate greedy accuracy on the GSM8K test set before and after.
+On the CPU, `tests/test_ddp.py` checks that the ranks stay identical (also when one
+has nothing to train) and still learn, and `tests/test_gsm8k_driver.py` runs every
+phase end to end on a tiny model.
+
 ## Build and test
 
 ```bash

@@ -28,6 +28,7 @@ log-probabilities, the behaviour policy's, so the importance correction stays ri
   - one step ahead (run_async): the next batch is generated, with the current weights,
     while the current one trains."""
 
+import contextlib
 import random
 import threading
 import time
@@ -102,8 +103,14 @@ class Sample:
 
 
 class GRPO:
-    def __init__(self, model, engine, policy, reward_fn, config=GRPOConfig()):
+    """ddp: optionally tandem's DDP wrapping `policy`, for data parallelism across ranks
+    (each rank its own relay engine and its own share of the prompts). Gradients are then
+    averaged once per optimizer step: micro-batches before the last accumulate locally,
+    and a rank with nothing to train still joins the reduction with zero gradients."""
+
+    def __init__(self, model, engine, policy, reward_fn, config=GRPOConfig(), ddp=None):
         self.model, self.engine, self.policy = model, engine, policy
+        self.ddp = ddp
         self.reward_fn, self.cfg = reward_fn, config
         self.opt = torch.optim.AdamW(policy.parameters(), lr=config.lr, betas=config.betas,
                                      weight_decay=config.weight_decay)
@@ -195,6 +202,8 @@ class GRPO:
         stats = {"loss": 0.0, "clipped": 0.0, "tokens": 0, "gap_max": 0.0, "gap_mean": 0.0, "gap_tokens": 0}
         if train:
             self._update(train, stats)
+        elif self.ddp is not None:
+            self._join_with_zero_gradients()
         stats["trained_samples"] = len(train)
         return stats
 
@@ -301,19 +310,37 @@ class GRPO:
         for _ in range(cfg.epochs):
             self.rng.shuffle(order)
             self.opt.zero_grad(set_to_none=True)
-            for k in range(0, len(order), cfg.micro_batch):
-                idx = order[k:k + cfg.micro_batch]
-                mb = [train[i] for i in idx]
-                new = pol.token_logprobs([s.prompt for s in mb], [s.tokens for s in mb], cfg.temperature)
-                new_lp = torch.cat(new)
-                old_lp = torch.cat([old[i] for i in idx])
-                adv = torch.cat([torch.full((len(s.tokens),), s.advantage, device=dev) for s in mb])
-                loss, clipped = clipped_objective(new_lp, old_lp, adv, cfg.clip)
-                (loss / total).backward()
+            chunks = [order[k:k + cfg.micro_batch] for k in range(0, len(order), cfg.micro_batch)]
+            for n, idx in enumerate(chunks):
+                last = n == len(chunks) - 1
+                ctx = self.ddp.no_sync() if self.ddp is not None and not last else contextlib.nullcontext()
+                with ctx:
+                    mb = [train[i] for i in idx]
+                    new = pol.token_logprobs([s.prompt for s in mb], [s.tokens for s in mb], cfg.temperature)
+                    new_lp = torch.cat(new)
+                    old_lp = torch.cat([old[i] for i in idx])
+                    adv = torch.cat([torch.full((len(s.tokens),), s.advantage, device=dev) for s in mb])
+                    loss, clipped = clipped_objective(new_lp, old_lp, adv, cfg.clip)
+                    (loss / total).backward()
                 stats["loss"] += loss.item() / total
                 stats["clipped"] += clipped.item()
-            if cfg.max_grad_norm:
-                torch.nn.utils.clip_grad_norm_(pol.parameters(), cfg.max_grad_norm)
-            self.opt.step()
+            self._optimizer_step()
         stats["loss"] /= cfg.epochs
         stats["clipped"] /= cfg.epochs
+
+    def _optimizer_step(self):
+        if self.cfg.max_grad_norm:
+            torch.nn.utils.clip_grad_norm_(self.policy.parameters(), self.cfg.max_grad_norm)
+        self.opt.step()
+
+    def _join_with_zero_gradients(self):
+        """This rank has nothing to train this step (every group scored the same), but the
+        others do: join their gradient reduction with zeros, then take the same optimizer
+        step on the averaged gradients, so every rank keeps identical weights. The zeros
+        come from a real forward and backward (on a two-token input, loss times 0) so that
+        gradients arrive in the same order as on the other ranks: DDP groups them into
+        buckets by arrival order, and the ranks' buckets must match."""
+        for _ in range(self.cfg.epochs):
+            self.opt.zero_grad(set_to_none=True)
+            (torch.cat(self.policy.token_logprobs([[1]], [[1]])).sum() * 0.0).backward()
+            self._optimizer_step()

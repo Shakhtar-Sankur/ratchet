@@ -8,6 +8,7 @@ scripts/build_relay.sh builds it."""
 
 import ctypes
 import os
+import sys
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -92,6 +93,24 @@ def lib():
             f.restype, f.argtypes = res, args
         _lib = L
     return _lib
+
+
+import contextlib
+
+
+@contextlib.contextmanager
+def _torch_device_kept():
+    """relay's CUDA backend selects its own GPU on every call; give PyTorch back the
+    device it had (a trainer on GPU 0 and relay on GPU 1 share the thread)."""
+    torch = sys.modules.get("torch")
+    dev = None
+    if torch is not None and torch.cuda.is_available() and torch.cuda.is_initialized():
+        dev = torch.cuda.current_device()
+    try:
+        yield
+    finally:
+        if dev is not None:
+            torch.cuda.set_device(dev)
 
 
 def _check(rc):
@@ -202,8 +221,9 @@ class Engine:
         self.model = model
         self.backend = backend
         self.max_seqs = max_seqs
-        self._h = lib().relay_engine_new(model._h, backend.encode(), device, num_blocks, block_size,
-                                         max_batch_tokens, max_seqs, int(prefix_caching))
+        with _torch_device_kept():
+            self._h = lib().relay_engine_new(model._h, backend.encode(), device, num_blocks, block_size,
+                                             max_batch_tokens, max_seqs, int(prefix_caching))
         if not self._h:
             _check(-1)
         self._events = (_Event * max(max_seqs, 1))()
@@ -226,7 +246,8 @@ class Engine:
         _check(lib().relay_engine_add_resume(self._h, id, p, len(prompt), ctypes.byref(sp), g, len(generated)))
 
     def step(self):
-        n = _check(lib().relay_engine_step(self._h, self._events, len(self._events)))
+        with _torch_device_kept():
+            n = _check(lib().relay_engine_step(self._h, self._events, len(self._events)))
         return [Event(e.id, e.token, e.index, e.finish, e.logprob) for e in self._events[:n]]
 
     def has_work(self):
@@ -240,7 +261,8 @@ class Engine:
 
     def reload_weights(self):
         """Use the model's current host weights (after a trainer wrote them); drops the prefix cache."""
-        _check(lib().relay_engine_reload_weights(self._h))
+        with _torch_device_kept():
+            _check(lib().relay_engine_reload_weights(self._h))
 
     def update_tensor(self, name, data):
         """The fast weight sync: overwrites one of the backend's weights from a contiguous
@@ -256,11 +278,13 @@ class Engine:
             if data.dtype != np.float32 or not data.flags["C_CONTIGUOUS"]:
                 raise RelayError(f"{name}: needs a contiguous float32 array")
             ptr, n = data.ctypes.data, data.size
-        _check(lib().relay_engine_update_tensor(self._h, name.encode(), ctypes.c_void_p(ptr), n))
+        with _torch_device_kept():
+            _check(lib().relay_engine_update_tensor(self._h, name.encode(), ctypes.c_void_p(ptr), n))
 
     def finish_update(self):
         """Ends a weight update: drops the prefix cache (its KV entries used the old weights)."""
-        _check(lib().relay_engine_finish_update(self._h))
+        with _torch_device_kept():
+            _check(lib().relay_engine_finish_update(self._h))
 
     def stats(self):
         s = _Stats()

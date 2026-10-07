@@ -121,3 +121,13 @@ def test_update_tensor_rejects_bad_input():
     e.add(1, [1, 2], max_new_tokens=3)
     with pytest.raises(relay.RelayError, match="in flight"):
         e.update_tensor("final_norm", torch.zeros(model.config.hidden))
+
+
+def test_activation_checkpointing_gives_the_same_gradients():
+    _, a = load("qwen2-bias")
+    _, b = load("qwen2-bias")
+    b.checkpoint = True
+    for p in (a, b):
+        torch.cat(p.token_logprobs([[1, 2, 3, 4]], [[5, 6, 7]])).sum().backward()
+    for (n, x), y in zip(a.named_parameters(), b.parameters()):
+        assert torch.allclose(x.grad, y.grad, atol=1e-6, rtol=1e-5), n

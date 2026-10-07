@@ -8,6 +8,7 @@ import math
 
 import torch
 import torch.nn as nn
+import torch.utils.checkpoint
 import torch.nn.functional as F
 
 
@@ -79,28 +80,37 @@ class Policy(nn.Module):
         a, b = x.chunk(2, dim=-1)
         return torch.cat([a * cos - b * sin, b * cos + a * sin], dim=-1)
 
-    def forward(self, tokens):
+    checkpoint = False  # recompute each layer in backward instead of storing its activations
+
+    def _layer(self, L, x, pos):
         c = self.config
-        B, T = tokens.shape
+        B, T = x.shape[:2]
         H, KV, D = c.heads, c.kv_heads, c.head_dim
+        h = rmsnorm(x, L.attn_norm, c.rms_eps)
+        qkv = F.linear(h, L.wqkv, L.bqkv)
+        q, k, v = qkv.split([H * D, KV * D, KV * D], dim=-1)
+        q = self._rope(q.view(B, T, H, D).transpose(1, 2), pos)
+        k = self._rope(k.view(B, T, KV, D).transpose(1, 2), pos)
+        v = v.view(B, T, KV, D).transpose(1, 2)
+        if KV != H:  # grouped-query attention: query head h reads kv head h // (H / KV)
+            k = k.repeat_interleave(H // KV, dim=1)
+            v = v.repeat_interleave(H // KV, dim=1)
+        a = F.scaled_dot_product_attention(q, k, v, is_causal=True, scale=1.0 / math.sqrt(D))
+        x = x + F.linear(a.transpose(1, 2).reshape(B, T, H * D), L.wo)
+        h = rmsnorm(x, L.mlp_norm, c.rms_eps)
+        gate, up = F.linear(h, L.w_gate_up).chunk(2, dim=-1)
+        x = x + F.linear(F.silu(gate) * up, L.w_down)
+        return x
+
+    def forward(self, tokens):
         x = F.embedding(tokens, self.embed)
-        pos = torch.arange(T, device=tokens.device)
+        pos = torch.arange(tokens.shape[1], device=tokens.device)
         for L in self.layers:
-            h = rmsnorm(x, L.attn_norm, c.rms_eps)
-            qkv = F.linear(h, L.wqkv, L.bqkv)
-            q, k, v = qkv.split([H * D, KV * D, KV * D], dim=-1)
-            q = self._rope(q.view(B, T, H, D).transpose(1, 2), pos)
-            k = self._rope(k.view(B, T, KV, D).transpose(1, 2), pos)
-            v = v.view(B, T, KV, D).transpose(1, 2)
-            if KV != H:  # grouped-query attention: query head h reads kv head h // (H / KV)
-                k = k.repeat_interleave(H // KV, dim=1)
-                v = v.repeat_interleave(H // KV, dim=1)
-            a = F.scaled_dot_product_attention(q, k, v, is_causal=True, scale=1.0 / math.sqrt(D))
-            x = x + F.linear(a.transpose(1, 2).reshape(B, T, H * D), L.wo)
-            h = rmsnorm(x, L.mlp_norm, c.rms_eps)
-            gate, up = F.linear(h, L.w_gate_up).chunk(2, dim=-1)
-            x = x + F.linear(F.silu(gate) * up, L.w_down)
-        return rmsnorm(x, self.final_norm, c.rms_eps)
+            if self.checkpoint and torch.is_grad_enabled():
+                x = torch.utils.checkpoint.checkpoint(self._layer, L, x, pos, use_reentrant=False)
+            else:
+                x = self._layer(L, x, pos)
+        return rmsnorm(x, self.final_norm, self.config.rms_eps)
 
     def head(self):
         return self.embed if self.lm_head is None else self.lm_head
