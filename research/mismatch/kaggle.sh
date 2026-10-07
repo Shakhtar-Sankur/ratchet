@@ -1,6 +1,7 @@
 #!/bin/bash
-# Mismatch decomposition on Kaggle (GPU T4 x2, Internet on): relay samples on GPU 0, the
-# trainer runs on GPU 1. ~45 minutes. Paste from "== mismatch" to "== done".
+# Mismatch decomposition on Kaggle (GPU T4 x2 or a single T4, Internet on): relay samples on
+# GPU 0; the trainer runs on GPU 1 when there is one, else beside relay on GPU 0.
+# ~45 minutes. Paste from "== mismatch" to "== done".
 set -e
 cd /kaggle/working 2>/dev/null || cd /tmp
 rm -rf ratchet && git clone -q --recursive https://github.com/Shakhtar-Sankur/ratchet && cd ratchet
@@ -23,7 +24,10 @@ print("ready")
 PY
 export PYTHONPATH=$PWD
 mkdir -p runs
-R="python research/mismatch/decompose.py --model models/qwen --data data --train-device cuda:1 --relay-device 0"
+NGPU=$(nvidia-smi --query-gpu=index --format=csv,noheader | wc -l)
+TRAIN=cuda:$([ "$NGPU" -ge 2 ] && echo 1 || echo 0)
+echo "GPUs: $NGPU, relay on cuda:0, trainer on $TRAIN"
+R="python research/mismatch/decompose.py --model models/qwen --data data --train-device $TRAIN --relay-device 0"
 echo "== 1. trainer uses the engine's fp16-rounded weights (ratchet's fix): steps 0, 1, 3, 10, 30"
 $R --train-weights fp16 --checkpoints 0,1,3,10,30 --out runs/fix.jsonl | python research/mismatch/show.py
 echo "== 2. trainer uses its float32 master weights (the bug): steps 0, 1, 3, 10"
