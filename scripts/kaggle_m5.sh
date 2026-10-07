@@ -36,6 +36,8 @@ PY
 export PYTHONPATH=$PWD
 mkdir -p runs
 G="python -m ratchet.gsm8k"
+# Live progress: evaluations and every 10th step as they happen (everything is in runs/*.jsonl).
+SHOW() { grep --line-buffered -E '"phase"|"step": [0-9]*0,' || true; }
 COMMON="--model models/qwen --data data"
 if [ "$RUN" = full ] || [ "$RUN" = colocated ]; then
   STEPS=100; EVAL=""; TSTEPS=20
@@ -48,12 +50,12 @@ echo "== check: fp16 vs fp32 log-probabilities, weight sync, answer lengths (GPU
 $G check $COMMON --out runs/check.jsonl
 fi
 echo "== colocated: tandem DDP over both GPUs, each generates then trains ($STEPS steps)"
-$G colocated $COMMON --steps $STEPS $EVAL --out runs/colocated.jsonl | tail -n 3
+$G colocated $COMMON --steps $STEPS $EVAL --out runs/colocated.jsonl | SHOW
 if [ "$RUN" != colocated ]; then
 echo "== split, synchronous: GPU 1 generates, then GPU 0 trains ($TSTEPS steps, timing only)"
-$G split $COMMON --train-device cuda:0 --relay-device 1 --steps $TSTEPS --skip-eval --out runs/split_sync.jsonl | tail -n 1
+$G split $COMMON --train-device cuda:0 --relay-device 1 --steps $TSTEPS --skip-eval --out runs/split_sync.jsonl | SHOW
 echo "== split, one step ahead + partial rollouts ($STEPS steps)"
-$G split $COMMON --train-device cuda:0 --relay-device 1 --steps $STEPS --ahead --partial $EVAL --out runs/split_async.jsonl | tail -n 3
+$G split $COMMON --train-device cuda:0 --relay-device 1 --steps $STEPS --ahead --partial $EVAL --out runs/split_async.jsonl | SHOW
 fi
 echo "== summary"
 python scripts/summarize.py runs
