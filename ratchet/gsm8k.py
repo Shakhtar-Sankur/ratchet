@@ -72,9 +72,11 @@ class ChatTokenizer:
         self.tok = AutoTokenizer.from_pretrained(model_dir)
 
     def prompt_ids(self, question):
+        # Render the chat template to text, then tokenize: apply_chat_template(tokenize=True)
+        # returns a list in some transformers versions and a BatchEncoding in others.
         msgs = [{"role": "user", "content": tasks.PROMPT.format(question=question)}]
-        ids = self.tok.apply_chat_template(msgs, add_generation_prompt=True, tokenize=True)
-        return list(ids["input_ids"] if isinstance(ids, dict) else ids)
+        text = self.tok.apply_chat_template(msgs, add_generation_prompt=True, tokenize=False)
+        return [int(t) for t in self.tok(text, add_special_tokens=False)["input_ids"]]
 
     def decode(self, ids):
         return self.tok.decode(ids, skip_special_tokens=True)

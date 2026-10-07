@@ -233,6 +233,8 @@ class Engine:
         return _Sampling(temperature, top_p, top_k, max_new_tokens, seed, int(ignore_eos))
 
     def add(self, id, prompt, max_new_tokens, temperature=1.0, top_p=1.0, top_k=0, seed=0, ignore_eos=False):
+        if not all(isinstance(t, int) for t in prompt):
+            raise RelayError(f"prompt must be token ids (int), got {type(prompt[0]).__name__ if prompt else 'nothing'}")
         p = (ctypes.c_int * len(prompt))(*prompt)
         sp = self._sampling(temperature, top_p, top_k, max_new_tokens, seed, ignore_eos)
         _check(lib().relay_engine_add(self._h, id, p, len(prompt), ctypes.byref(sp)))
