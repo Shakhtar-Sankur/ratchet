@@ -30,7 +30,7 @@ The engineering problems are the ones that dominate RL post-training at scale:
 | | Milestone | State |
 |---|---|---|
 | M0 | relay from Python: a C interface (`relay/c_api.h`, `librelay_c`) to load a model, write its weights, and generate rollouts with per-token log-probabilities; resume unfinished rollouts | done |
-| M1 | The trainer's policy in PyTorch, in relay's fused weight layout so a sync is a copy; its log-probabilities checked against relay's rollouts | |
+| M1 | The trainer's policy in PyTorch, in relay's fused weight layout so a sync is a copy; its log-probabilities checked against relay's rollouts | done (CPU; GPU gap measured in M5) |
 | M2 | GRPO: rewards, group-normalised advantages, clipped objective, AdamW; a toy task learned on CPU | |
 | M3 | Fast weight sync: relay's GPU weights updated in place instead of rebuilt | |
 | M4 | The long tail: partial rollouts that pause and resume across steps, and one-step-ahead asynchronous training | |
@@ -65,6 +65,24 @@ RoPE scaling):
   restores the original output (the stale prefix cache is dropped);
 - relay's own C++ test checks the log-probabilities against the log-softmax of the
   logits each token was sampled from, within 1e-5.
+
+## M1: the trainer's policy
+
+`ratchet/policy.py` is a Llama/Qwen2 decoder in PyTorch whose parameters have relay's
+names and fused layout (`layers.3.wqkv`, `layers.3.w_gate_up`, ...): it is built from a
+`relay.Model`, and `sync_to(model)` copies it back, tensor by tensor, with no
+renaming or reshaping. `token_logprobs(prompts, responses)` runs the LM head only on
+the positions that predict response tokens.
+
+| Model (test fixtures: multi-head, grouped-query with tied bf16 weights, Qwen2 biases, Llama 3 RoPE) | Logits vs transformers (relative) | Rollout log-prob (relay) vs trainer log-prob |
+|---|---|---|
+| chat-tiny, qwen2-bias, llama-gqa-tied-bf16, llama-mha | 0 (identical) | at most 9.5e-7 |
+| llama3-rope | 2.1e-7 | 4.8e-7 |
+
+Both run float32 on the CPU; what is left is relay storing each log-probability as a
+float. The tests also update the policy, sync it into relay, and check the agreement
+again on new rollouts, so a sync that missed a tensor would fail. On a GPU relay runs
+in fp16 while the trainer stays fp32; that gap is not zero, and M5 measures it.
 
 ## Build and test
 
