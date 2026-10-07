@@ -199,7 +199,8 @@ class GRPO:
             for s, a in zip(samples, adv.tolist()):
                 s.advantage = a
         train = [s for s in samples if s.tokens and (s.advantage != 0 or not cfg.skip_zero_advantage)]
-        stats = {"loss": 0.0, "clipped": 0.0, "tokens": 0, "gap_max": 0.0, "gap_mean": 0.0, "gap_tokens": 0}
+        stats = {"loss": 0.0, "clipped": 0.0, "tokens": 0, "gap_max": 0.0, "gap_mean": 0.0, "gap_tokens": 0,
+                 "gap_over": 0}
         if train:
             self._update(train, stats)
         elif self.ddp is not None:
@@ -278,6 +279,8 @@ class GRPO:
             "clip_frac": stats["clipped"] / n_tok,
             "logprob_gap_max": stats["gap_max"],  # |trainer - relay| at the same weights
             "logprob_gap_mean": stats["gap_mean"] / max(stats["gap_tokens"], 1),
+            # tokens whose importance ratio relay/trainer is outside 1 +- 0.2 at equal weights
+            "logprob_gap_frac_over_0.2": stats["gap_over"] / max(stats["gap_tokens"], 1),
             "time_generate": t_gen,
             "time_train": t_learn,
             "time_sync": t_sync,
@@ -305,6 +308,7 @@ class GRPO:
                         stats["gap_max"] = max(stats["gap_max"], gap.max().item())
                         stats["gap_mean"] += gap.sum().item()
                         stats["gap_tokens"] += gap.numel()
+                        stats["gap_over"] += ((lp - rel).exp() - 1).abs().gt(0.2).sum().item()
                     old.append(lp if cfg.old_logprobs == "trainer" and not s.stale else rel)
         order = list(range(len(train)))
         for _ in range(cfg.epochs):

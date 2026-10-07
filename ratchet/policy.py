@@ -16,6 +16,19 @@ def rmsnorm(x, w, eps):
     return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + eps) * w
 
 
+class _Rounded(torch.autograd.Function):
+    """The weight rounded to `dtype` and back (round to nearest even, as relay converts
+    it); the gradient passes straight through to the float32 master weight."""
+
+    @staticmethod
+    def forward(ctx, w, dtype):
+        return w.to(dtype).to(w.dtype)
+
+    @staticmethod
+    def backward(ctx, g):
+        return g, None
+
+
 class Layer(nn.Module):
     def __init__(self, c):
         super().__init__()
@@ -65,6 +78,9 @@ class Policy(nn.Module):
         policy on a GPU and relay's CUDA backend, the copy stays on the GPU (fp32 to fp16
         on the device, a peer copy if they are on different GPUs); the relay model's host
         copy is not updated. On the CPU backend it writes the host weights."""
+        on_gpu = self.embed.is_cuda
+        if on_gpu:  # relay reads on its own CUDA stream: let the optimizer's writes land first
+            torch.cuda.synchronize(self.embed.device)
         with torch.no_grad():
             for name, param in self.named_parameters():
                 t = param.detach()
@@ -72,6 +88,8 @@ class Policy(nn.Module):
                     t = t.cpu()
                 engine.update_tensor(name, t.to(torch.float32).contiguous())
         engine.finish_update()
+        if on_gpu and engine.backend == "cuda":  # ...and finish reading before the next update
+            torch.cuda.synchronize(torch.device("cuda", engine.device))
 
     def _rope(self, x, positions):
         # x [B, H, T, D]: pairs (i, i + D/2) rotated by position * inv_freq[i] (rotate_half).
@@ -82,12 +100,23 @@ class Policy(nn.Module):
 
     checkpoint = False  # recompute each layer in backward instead of storing its activations
 
+    # The precision the inference engine stores the weight matrices in (embedding, LM head
+    # and projections; relay keeps norms and biases in float32). relay's CUDA backend uses
+    # fp16, so set torch.float16 there: the trainer then computes with exactly the weights
+    # the rollouts were sampled with, and the optimizer updates the float32 master copy.
+    # Without it the two drift apart: an update of about the learning rate is below half
+    # an fp16 step for most weights, so relay rounds it away while the trainer keeps it.
+    weight_dtype = None
+
+    def _w(self, w):
+        return w if self.weight_dtype is None else _Rounded.apply(w, self.weight_dtype)
+
     def _layer(self, L, x, pos):
         c = self.config
         B, T = x.shape[:2]
         H, KV, D = c.heads, c.kv_heads, c.head_dim
         h = rmsnorm(x, L.attn_norm, c.rms_eps)
-        qkv = F.linear(h, L.wqkv, L.bqkv)
+        qkv = F.linear(h, self._w(L.wqkv), L.bqkv)
         q, k, v = qkv.split([H * D, KV * D, KV * D], dim=-1)
         q = self._rope(q.view(B, T, H, D).transpose(1, 2), pos)
         k = self._rope(k.view(B, T, KV, D).transpose(1, 2), pos)
@@ -96,14 +125,14 @@ class Policy(nn.Module):
             k = k.repeat_interleave(H // KV, dim=1)
             v = v.repeat_interleave(H // KV, dim=1)
         a = F.scaled_dot_product_attention(q, k, v, is_causal=True, scale=1.0 / math.sqrt(D))
-        x = x + F.linear(a.transpose(1, 2).reshape(B, T, H * D), L.wo)
+        x = x + F.linear(a.transpose(1, 2).reshape(B, T, H * D), self._w(L.wo))
         h = rmsnorm(x, L.mlp_norm, c.rms_eps)
-        gate, up = F.linear(h, L.w_gate_up).chunk(2, dim=-1)
-        x = x + F.linear(F.silu(gate) * up, L.w_down)
+        gate, up = F.linear(h, self._w(L.w_gate_up)).chunk(2, dim=-1)
+        x = x + F.linear(F.silu(gate) * up, self._w(L.w_down))
         return x
 
     def forward(self, tokens):
-        x = F.embedding(tokens, self.embed)
+        x = self._w(F.embedding(tokens, self.embed))  # rounding the rows used = rounding the table
         pos = torch.arange(tokens.shape[1], device=tokens.device)
         for L in self.layers:
             if self.checkpoint and torch.is_grad_enabled():
@@ -113,7 +142,7 @@ class Policy(nn.Module):
         return rmsnorm(x, self.final_norm, self.config.rms_eps)
 
     def head(self):
-        return self.embed if self.lm_head is None else self.lm_head
+        return self._w(self.embed if self.lm_head is None else self.lm_head)
 
     def logits(self, tokens):
         return F.linear(self(tokens), self.head())

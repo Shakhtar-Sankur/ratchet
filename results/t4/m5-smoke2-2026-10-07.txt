@@ -1,0 +1,20 @@
+ratchet M5 smoke run 2, Kaggle 2x Tesla T4 (driver 580.178.04, CUDA 12.8), 2026-10-07.
+ratchet b45713f, relay b452d52, tandem 95c06d5. Qwen2.5-0.5B-Instruct, GSM8K.
+The trainer now computes with its matrices rounded to fp16 (Policy.weight_dtype); the check
+phase measures the gap after two real GRPO steps both ways. Summary lines:
+
+[check] rollout: 64 samples, 16118 tokens, 928 tok/s; lengths median 244, p90 354, max 384
+[check] fp16 relay vs fp32 trainer log-prob: max |gap| 0.0414, mean 0.000684, p99 0.00845, mean signed 2.93e-05; ratio outside 1±0.2: 0.00% of tokens
+[check] weight sync (494M params): reload 6.379 s, push 0.018 s (362.1x, 112.2 GB/s); identical rollouts: True
+[check] after 2 GRPO steps (lr 1e-06), trainer with float32 weights: max |gap| 5.21, mean 0.0117, p99 0.155; ratio outside 1±0.2: 0.65% of tokens
+[check] after 2 GRPO steps (lr 1e-06), trainer with fp16 rounded weights: max |gap| 0.0433, mean 0.000672, p99 0.00777; ratio outside 1±0.2: 0.00% of tokens
+[colocated] eval before: accuracy 42.2% of 64, '####' format 39%, truncated 3%, mean 314 tokens, 927 tok/s
+[colocated] eval after: accuracy 40.6% of 64, '####' format 5%, truncated 3%, mean 297 tokens, 965 tok/s
+[colocated] 3 steps, colocated: step 30.9 s (generate 14.5, train 16.2, sync 0.18); log-prob gap max (fresh samples) median 0.0371, mean 0.00066, ratio off by >0.2 0.00%; clip 0.0%
+[split_async] eval before: accuracy 42.2% of 64, '####' format 41%, truncated 3%, mean 313 tokens, 639 tok/s
+[split_async] eval after: accuracy 39.1% of 64, '####' format 25%, truncated 5%, mean 312 tokens, 643 tok/s
+[split_async] 3 steps, split+async+partial: step 25.6 s (generate 23.7, train 25.2, sync 0.39); clip 0.2%
+[split_sync] 3 steps, split: step 56.0 s (generate 22.4, train 35.1, sync 0.39); log-prob gap max (fresh samples) median 0.052, mean 0.00067, ratio off by >0.2 0.00%; clip 0.0%
+
+Raw check record (gap_after_updates):
+{"steps": 2, "lr": 1e-06, "last_step_reward": 0.203125, "float32_weights": {"tokens": 19313, "max_abs": 5.20649528503418, "mean_abs": 0.011741961352527142, "p99_abs": 0.154783234000206, "mean_signed": -0.0015288383001461625, "ratio_max_dev": 0.9945191740989685, "ratio_outside_clip_0.2": 0.00647232448682189}, "fp16_rounded_weights": {"tokens": 19313, "max_abs": 0.04327678680419922, "mean_abs": 0.0006721525569446385, "p99_abs": 0.0077654412016272545, "mean_signed": 9.395153938385192e-06, "ratio_max_dev": 0.042353689670562744, "ratio_outside_clip_0.2": 0.0}}

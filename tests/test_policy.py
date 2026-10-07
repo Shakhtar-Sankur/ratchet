@@ -131,3 +131,25 @@ def test_activation_checkpointing_gives_the_same_gradients():
         torch.cat(p.token_logprobs([[1, 2, 3, 4]], [[5, 6, 7]])).sum().backward()
     for (n, x), y in zip(a.named_parameters(), b.parameters()):
         assert torch.allclose(x.grad, y.grad, atol=1e-6, rtol=1e-5), n
+
+
+def test_fp16_weights_are_relays_weights_with_straight_through_gradients():
+    # relay's CUDA backend stores the matrices in fp16 (norms and biases in fp32). With
+    # weight_dtype set, the trainer computes with exactly those values, and the gradient
+    # reaches its float32 master weights unchanged.
+    matrices = {"embed", "lm_head", "wqkv", "wo", "w_gate_up", "w_down"}
+    _, a = load("qwen2-bias")
+    _, b = load("qwen2-bias")
+    with torch.no_grad():
+        for p in a.parameters():
+            p.add_(torch.randn_like(p) * 1e-3)  # off the fp16 grid, as after an update
+        for (n, p), q in zip(a.named_parameters(), b.parameters()):
+            q.copy_(p.half().float() if n.split(".")[-1] in matrices else p)
+    a.weight_dtype = torch.float16
+    assert any(not torch.equal(p, q) for p, q in zip(a.parameters(), b.parameters()))
+    for p in (a, b):
+        torch.cat(p.token_logprobs([[1, 2, 3, 4]], [[5, 6, 7]])).sum().backward()
+    with torch.no_grad():
+        assert torch.equal(a.logits(torch.tensor([[1, 2, 3]])), b.logits(torch.tensor([[1, 2, 3]])))
+    for (n, x), y in zip(a.named_parameters(), b.parameters()):
+        assert torch.equal(x.grad, y.grad), n

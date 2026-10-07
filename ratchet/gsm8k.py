@@ -123,6 +123,17 @@ def engine_for(model, args, device):
                         max_batch_tokens=args.max_batch_tokens, max_seqs=args.max_seqs)
 
 
+def policy_for(model, args, device):
+    """The trainer's policy. On relay's CUDA backend its weight matrices are used rounded
+    to fp16, as relay stores them (see Policy.weight_dtype); float32 master weights."""
+    policy = Policy.from_relay(model, device=device)
+    dtype = args.weight_dtype
+    if dtype == "auto":
+        dtype = "fp16" if args.backend == "cuda" else "fp32"
+    policy.weight_dtype = torch.float16 if dtype == "fp16" else None
+    return policy
+
+
 def grpo_config(args, seed, **kw):
     return GRPOConfig(group_size=args.group, max_new_tokens=args.max_new, temperature=1.0, lr=args.lr,
                       clip=args.clip, micro_batch=args.micro_batch, old_logprobs=args.old_logprobs,
@@ -161,12 +172,28 @@ def batches(problems, tok, per_step, steps, seed, rank=0, world=1, want=None):
 # ---- check ----------------------------------------------------------------------------
 
 
+def gap_stats(policy, prompts, responses, logprobs, micro_batch):
+    """|trainer log p - relay log p| over the tokens of these rollouts."""
+    gaps = []
+    with torch.no_grad():
+        for k in range(0, len(prompts), micro_batch):
+            lps = policy.token_logprobs(prompts[k:k + micro_batch], responses[k:k + micro_batch])
+            for i, lp in enumerate(lps):
+                gaps.append(lp.cpu() - torch.tensor(logprobs[k + i]))
+    g = torch.cat(gaps)
+    a = g.abs()
+    return {"tokens": g.numel(), "max_abs": a.max().item(), "mean_abs": a.mean().item(),
+            "p99_abs": a.quantile(0.99).item(), "mean_signed": g.mean().item(),
+            "ratio_max_dev": (g.exp() - 1).abs().max().item(),
+            "ratio_outside_clip_0.2": ((g.exp() - 1).abs() > 0.2).float().mean().item()}
+
+
 def check(args):
     dev = args.train_device
     tok = ChatTokenizer(args.model)
     model = relay.Model(args.model)
     engine = engine_for(model, args, args.relay_device)
-    policy = Policy.from_relay(model, device=dev)
+    policy = policy_for(model, args, dev)
     probs = load_problems(args.data, "train", 64)
     rec = {"phase": "check", "backend": args.backend, "model": os.path.basename(os.path.normpath(args.model))}
 
@@ -185,21 +212,12 @@ def check(args):
                       "max_over_median": lens[-1] / max(lens[32], 1)}
 
     # 2. The fp16 (relay) vs fp32 (trainer) log-probability gap on those tokens.
-    gaps = []
-    with torch.no_grad():
-        for k in range(0, 64, args.micro_batch):
-            prompts = [ids[i // 8] for i in range(k, min(k + args.micro_batch, 64))]
-            lps = policy.token_logprobs(prompts, resp[k:k + args.micro_batch])
-            for i, lp in enumerate(lps):
-                gaps.append(lp.cpu() - torch.tensor(out[k + i].logprobs))
-    g = torch.cat(gaps)
-    a = g.abs()
-    rec["logprob_gap"] = {"tokens": g.numel(), "max_abs": a.max().item(), "mean_abs": a.mean().item(),
-                          "p99_abs": a.quantile(0.99).item(), "mean_signed": g.mean().item(),
-                          "ratio_max_dev": (g.exp() - 1).abs().max().item(),
-                          "ratio_outside_clip_0.2": ((g.exp() - 1).abs() > 0.2).float().mean().item()}
+    rec["logprob_gap"] = gap_stats(policy, [ids[i // 8] for i in range(64)], resp,
+                                   [out[k].logprobs for k in range(64)], args.micro_batch)
+    rec["weight_dtype"] = str(policy.weight_dtype)
 
     # 3. Weight sync: perturb the policy (as an update would), then reload vs push.
+    original = {n: p.detach().cpu().clone() for n, p in policy.named_parameters()}
     with torch.no_grad():
         gen = torch.Generator(device="cpu").manual_seed(0)
         for p in policy.parameters():
@@ -229,6 +247,36 @@ def check(args):
                    "reload_seconds": t_reload, "push_seconds_median": t_push[1], "push_seconds_all": t_push,
                    "speedup": t_reload / t_push[1], "push_GBps": nbytes / t_push[1] / 1e9,
                    "push_equals_reload": a_out == b_out}
+    # 4. After real GRPO updates: is relay still sampling from the trainer's policy? The
+    #    gap on fresh rollouts, with the trainer computing from its float32 weights as they
+    #    are, and from those weights rounded to fp16 as relay stores them.
+    if args.update_steps:
+        with torch.no_grad():
+            for n, p in policy.named_parameters():
+                p.copy_(original[n])
+        del original
+        policy.push_to(engine)
+        policy.checkpoint = True
+        kept, policy.weight_dtype = policy.weight_dtype, None  # train as before the fix
+        g = GRPO(model, engine, policy, make_reward(tok), grpo_config(args, seed=args.seed))
+        for k in range(args.update_steps):
+            batch = probs[8 + 8 * k:16 + 8 * k]
+            m = g.step([tok.prompt_ids(q) for q, _ in batch], [a for _, a in batch])
+        batch = probs[8 + 8 * args.update_steps:16 + 8 * args.update_steps]
+        pids = [tok.prompt_ids(q) for q, _ in batch]
+        for i, p in enumerate(pids):
+            for j in range(8):
+                engine.add(1000 + i * 8 + j, p, max_new_tokens=args.max_new, temperature=1.0, seed=7 + i * 8 + j)
+        o = engine.run()
+        resp2 = [o[1000 + k].tokens for k in range(64)]
+        lps2 = [o[1000 + k].logprobs for k in range(64)]
+        prompts2 = [pids[k // 8] for k in range(64)]
+        after = {"steps": args.update_steps, "lr": args.lr, "last_step_reward": m["reward"]}
+        for name, dtype in (("float32_weights", None), ("fp16_rounded_weights", torch.float16)):
+            policy.weight_dtype = dtype
+            after[name] = gap_stats(policy, prompts2, resp2, lps2, args.micro_batch)
+        policy.weight_dtype = kept
+        rec["gap_after_updates"] = after
     log(rec, args.out)
     return rec
 
@@ -260,7 +308,7 @@ def _colocated_rank(group, args):
     tok = ChatTokenizer(args.model)
     model = relay.Model(args.model)
     engine = engine_for(model, args, rank)
-    policy = Policy.from_relay(model, device=dev)
+    policy = policy_for(model, args, dev)
     policy.checkpoint = True
     ddp = dist.wrap(policy, group)
     g = GRPO(model, engine, policy, make_reward(tok), grpo_config(args, seed=args.seed * 1000 + rank), ddp=ddp)
@@ -313,7 +361,7 @@ def split(args):
     tok = ChatTokenizer(args.model)
     model = relay.Model(args.model)
     engine = engine_for(model, args, args.relay_device)
-    policy = Policy.from_relay(model, device=dev)
+    policy = policy_for(model, args, dev)
     policy.checkpoint = True
     kw = {}
     if args.partial:
@@ -372,6 +420,11 @@ def main(argv=None):
     ap.add_argument("--max-batch-tokens", type=int, default=1024)
     ap.add_argument("--max-seqs", type=int, default=64)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--weight-dtype", default="auto", choices=["auto", "fp16", "fp32"],
+                    help="the trainer computes with its weight matrices rounded to this (auto: fp16 on CUDA, "
+                         "as relay stores them)")
+    ap.add_argument("--update-steps", type=int, default=2,
+                    help="check: GRPO steps before measuring the relay/trainer gap again (0: skip)")
     args = ap.parse_args(argv)
     {"check": check, "eval": eval_only, "colocated": colocated, "split": split}[args.phase](args)
 

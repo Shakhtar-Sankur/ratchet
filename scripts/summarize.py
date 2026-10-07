@@ -20,6 +20,13 @@ for path in sorted(glob.glob(os.path.join(d, "*.jsonl"))):
             print(f"[{name}] weight sync ({sy['params'] / 1e6:.0f}M params): reload {sy['reload_seconds']:.3f} s, "
                   f"push {sy['push_seconds_median']:.3f} s ({sy['speedup']:.1f}x, {sy['push_GBps']:.1f} GB/s); "
                   f"identical rollouts: {sy['push_equals_reload']}")
+            au = r.get("gap_after_updates")
+            if au:
+                for k in ("float32_weights", "fp16_rounded_weights"):
+                    g = au[k]
+                    print(f"[{name}] after {au['steps']} GRPO steps (lr {au['lr']:g}), trainer with {k.replace('_', ' ')}: "
+                          f"max |gap| {g['max_abs']:.3g}, mean {g['mean_abs']:.3g}, p99 {g['p99_abs']:.3g}; "
+                          f"ratio outside 1±0.2: {100 * g['ratio_outside_clip_0.2']:.2f}% of tokens")
         elif r.get("phase") == "eval":
             print(f"[{name}] eval {r.get('when', '')}: accuracy {100 * r['accuracy']:.1f}% of {int(r['n'])}, "
                   f"'####' format {100 * r['format_rate']:.0f}%, truncated {100 * r['truncated']:.0f}%, "
@@ -34,5 +41,6 @@ for path in sorted(glob.glob(os.path.join(d, "*.jsonl"))):
         print(f"[{name}] {len(steps)} steps, {steps[0]['mode']}: step {med('time_step'):.1f} s (generate "
               f"{med('time_generate'):.1f}, train {med('time_train'):.1f}, sync {med('time_sync'):.2f}); "
               f"reward first 10 {first:.3f} -> last 10 {last:.3f}; max length median {med('max_length'):.0f}; "
-              f"log-prob gap max (fresh samples) median {med('logprob_gap_max'):.3g}; clip {100 * med('clip_frac'):.1f}%; "
+              f"log-prob gap max (fresh samples) median {med('logprob_gap_max'):.3g}, mean {med('logprob_gap_mean'):.2g}, "
+              f"ratio off by >0.2 {100 * med('logprob_gap_frac_over_0.2'):.2f}%; clip {100 * med('clip_frac'):.1f}%; "
               f"total {steps[-1].get('elapsed', 0) / 60:.1f} min")

@@ -220,6 +220,7 @@ class Engine:
                  max_seqs=64, prefix_caching=True):
         self.model = model
         self.backend = backend
+        self.device = device
         self.max_seqs = max_seqs
         with _torch_device_kept():
             self._h = lib().relay_engine_new(model._h, backend.encode(), device, num_blocks, block_size,

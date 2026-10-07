@@ -32,9 +32,9 @@ The engineering problems are the ones that dominate RL post-training at scale:
 | M0 | relay from Python: a C interface (`relay/c_api.h`, `librelay_c`) to load a model, write its weights, and generate rollouts with per-token log-probabilities; resume unfinished rollouts | done |
 | M1 | The trainer's policy in PyTorch, in relay's fused weight layout so a sync is a copy; its log-probabilities checked against relay's rollouts | done (CPU; GPU gap measured in M5) |
 | M2 | GRPO: rewards, group-normalised advantages, clipped objective, AdamW; a toy task learned on CPU | done |
-| M3 | Fast weight sync: relay's GPU weights updated in place instead of rebuilt | built and checked on CPU; GPU timing in M5 |
+| M3 | Fast weight sync: relay's GPU weights updated in place instead of rebuilt | done: 0.017 s instead of 6.3 s on a T4 (369×) |
 | M4 | The long tail: partial rollouts that pause and resume across steps, and one-step-ahead asynchronous training | built and checked on CPU; GPU timing in M5 |
-| M5 | Qwen2.5-0.5B-Instruct on GSM8K on two T4s: both GPUs alternating rollout and training, against one generating while the other trains; accuracy before and after | |
+| M5 | Qwen2.5-0.5B-Instruct on GSM8K on two T4s: both GPUs alternating rollout and training, against one generating while the other trains; accuracy before and after | smoke run done (every phase); full run next |
 | M6 | Write-up | |
 
 ## M0: relay from Python
@@ -82,7 +82,10 @@ the positions that predict response tokens.
 Both run float32 on the CPU; what is left is relay storing each log-probability as a
 float. The tests also update the policy, sync it into relay, and check the agreement
 again on new rollouts, so a sync that missed a tensor would fail. On a GPU relay runs
-in fp16 while the trainer stays fp32; that gap is not zero, and M5 measures it.
+in fp16 while the trainer stays fp32. Measured on a T4 with Qwen2.5-0.5B-Instruct at its
+released weights (16,118 sampled tokens): max |gap| 0.041, mean 6.8e-4, 99th percentile
+0.0085, and no token whose importance ratio is outside 1 ± 0.2. After training starts the
+gap grows unless the trainer uses relay's fp16 weights: see M5.
 
 ## M2: GRPO
 
@@ -127,8 +130,16 @@ model's host copy is older than the GPU's, so a later full reload is refused ins
 of quietly reverting the policy; and updates are refused while a rollout is running.
 
 On the CPU, a GRPO run with `sync="push"` is identical, token for token and
-log-probability for log-probability, to one with `sync="reload"`. The GPU time saved
-is measured in M5.
+log-probability for log-probability, to one with `sync="reload"`. On a T4 with
+Qwen2.5-0.5B-Instruct (494M parameters, 1.98 GB in fp32), trainer and relay on the same GPU:
+
+| Sync | Time | |
+|---|---|---|
+| reload: host copy, fp16 conversion on the CPU, fresh upload | 6.26 s | |
+| push: in place on the GPU | **0.017 s** | 369× faster, 116 GB/s of fp32 weights |
+
+Both give identical rollouts afterwards (checked on greedy decoding after perturbing every
+weight). Across two GPUs (the split mode, a peer copy over PCIe) a push takes 0.24 s.
 
 ## M4: the long tail
 
@@ -177,7 +188,7 @@ GPUs in M5. (With learning on, the toy reward teaches the model to avoid the
 end-of-sequence token, so every answer reaches the length limit and there is no tail
 left to cut.)
 
-## M5: GSM8K on two T4s (code ready; run pending)
+## M5: GSM8K on two T4s (smoke run done; full run next)
 
 `ratchet/gsm8k.py` runs the experiment on Qwen2.5-0.5B-Instruct and `scripts/kaggle_m5.sh`
 runs it on a Kaggle notebook with two T4s:
@@ -195,6 +206,37 @@ Both training modes evaluate greedy accuracy on the GSM8K test set before and af
 On the CPU, `tests/test_ddp.py` checks that the ranks stay identical (also when one
 has nothing to train) and still learn, and `tests/test_gsm8k_driver.py` runs every
 phase end to end on a tiny model.
+
+### What the first GPU runs found
+
+Two short runs of every phase (`results/t4/m5-smoke-2026-10-07.txt`) found two problems
+that the CPU tests could not:
+
+- **Sampling was the bottleneck: 34 tokens/s.** Qwen2.5's vocabulary has 151,936
+  entries, and relay's sampler sorted all of them on the CPU for every token, which
+  took longer than the GPU's forward pass. Sampling with no top-k or top-p (how RL
+  samples) needs no sort: relay now walks the inverse CDF in token order and samples the
+  batch's rows in parallel. 1.3 ms per token instead of 29.8 ms; rollouts at 931
+  tokens/s (64 answers, median 244 tokens).
+- **relay's fp16 weights swallowed the updates.** Before any training, relay and the
+  trainer agree (gap at most 0.041). After one or two updates, the gap on fresh rollouts
+  reached 4.5 to 6.4 nats on some tokens. The released weights are bf16, which fp16 holds
+  exactly, so at first relay has the trainer's weights bit for bit. But an AdamW step at
+  learning rate 1e-6 moves a weight by about 1e-6, and half an fp16 step is 7.6e-6 for a
+  weight of 0.02: relay rounds most of the update away, keeps it only on small weights,
+  and samples from a policy the trainer never had. The fix is what mixed-precision
+  training does: the trainer computes with its matrices rounded to fp16 exactly as relay
+  stores them (round to nearest even), and the optimizer updates float32 master weights
+  through a straight-through gradient (`Policy.weight_dtype`). Measured on the same 64
+  fresh rollouts (19,313 tokens) after two GRPO steps (`results/t4/m5-smoke2-2026-10-07.txt`):
+
+  | Trainer computes with | max \|gap\| | mean | 99th pct | ratio outside 1 ± 0.2 |
+  |---|---|---|---|---|
+  | float32 weights (before) | 5.21 | 0.0117 | 0.155 | 0.65% of tokens |
+  | fp16-rounded weights (now) | **0.043** | **0.00067** | **0.0078** | **0** |
+
+  With the fix the gap after training is what it was at the released weights (0.041), in
+  every mode: colocated and split runs report a per-step maximum of 0.03 to 0.06.
 
 ## Build and test
 

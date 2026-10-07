@@ -37,6 +37,10 @@ def test_check(env):
     assert rec["rollout"]["samples"] == 64
     assert rec["logprob_gap"]["max_abs"] < 1e-5          # CPU: fp32 on both sides
     assert rec["sync"]["push_equals_reload"] is True
+    after = rec["gap_after_updates"]                      # two real GRPO steps, then fresh rollouts:
+    assert after["steps"] == 2                            # on the CPU relay reads the float32 weights,
+    assert after["float32_weights"]["max_abs"] < 1e-5     # so it still samples the trainer's policy
+    assert after["fp16_rounded_weights"]["tokens"] == after["float32_weights"]["tokens"]
 
 
 def test_eval(env):
