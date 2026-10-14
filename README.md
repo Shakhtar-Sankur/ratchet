@@ -285,3 +285,7 @@ pip install -r requirements.txt
 scripts/build_relay.sh          # CUDA if nvcc is found, else CPU
 python -m pytest -q tests
 ```
+
+## License
+
+Apache-2.0. See [LICENSE](LICENSE).
