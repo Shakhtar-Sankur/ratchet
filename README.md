@@ -6,6 +6,8 @@ C++/CUDA inference engine and training on PyTorch with
 [tandem](https://github.com/Shakhtar-Sankur/tandem)'s data parallelism (its own
 collectives, no NCCL).
 
+Technical report: [*The Sampler Was Not the Policy: Finding and Removing a Silent Training–Inference Mismatch in a From-Scratch GRPO Stack*](paper/main.pdf) (4 pages; LaTeX source in [`paper/`](paper/); its numbers come from [`research/mismatch/results/`](research/mismatch/results/) and the results below).
+
 ```
           ┌──────────── one GRPO step ─────────────────────────────────────┐
  prompts ─▶ rollout (relay)            reward          train (PyTorch + tandem)
