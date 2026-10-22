@@ -120,3 +120,38 @@ def test_a_batch_reward_function_gives_the_same_run():
         ma, mb = a.step(prompts(s)), b.step(prompts(s))
         assert ma["reward"] == mb["reward"] and ma["loss"] == mb["loss"]
     assert calls == [len(ma["samples"])] * 3
+
+
+def test_truncated_is_weights_scale_each_tokens_gradient():
+    lp = torch.tensor([-1.0, -2.0, -0.5], requires_grad=True)
+    adv = torch.tensor([2.0, -1.0, 0.5])
+    w = torch.tensor([1.0, 0.5, 2.0])
+    loss, _ = clipped_objective(lp, lp.detach(), adv, clip=0.2, weight=w)
+    loss.backward()
+    assert torch.allclose(lp.grad, -adv * w)
+
+
+def test_truncated_is_changes_nothing_when_relay_and_the_trainer_agree():
+    """On the CPU relay and the trainer agree to 1e-6, so every weight is 1 and the run
+    samples the same tokens as one without truncated importance sampling."""
+    a, b = make(), make()
+    b.cfg.tis_cap = 2.0
+    for s in range(4):
+        ma, mb = a.step(prompts(s)), b.step(prompts(s))
+        assert [x.tokens for x in ma["samples"]] == [x.tokens for x in mb["samples"]]
+        assert abs(ma["loss"] - mb["loss"]) < 1e-4
+        assert ma["tis_weight_mean"] == 0 and abs(mb["tis_weight_mean"] - 1) < 1e-4
+        assert mb["tis_capped_frac"] == 0
+
+
+def test_truncated_is_caps_the_weight_of_tokens_relay_undersampled():
+    """Tokens relay found far less likely than the trainer does get the capped weight."""
+    g = make()
+    g.cfg.tis_cap = 2.0
+    samples = g.generate(prompts(0))
+    for s in samples:
+        s.logprobs = [lp - 3.0 for lp in s.logprobs]   # relay 20x less likely than the trainer
+    stats = g.learn(samples)
+    assert stats["tokens"] > 0
+    assert stats["tis_capped"] == stats["tokens"]
+    assert abs(stats["tis_weight"] / stats["tokens"] - 2.0) < 1e-6

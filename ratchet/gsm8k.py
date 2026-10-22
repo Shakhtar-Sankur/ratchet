@@ -137,7 +137,7 @@ def policy_for(model, args, device):
 def grpo_config(args, seed, **kw):
     return GRPOConfig(group_size=args.group, max_new_tokens=args.max_new, temperature=1.0, lr=args.lr,
                       clip=args.clip, micro_batch=args.micro_batch, old_logprobs=args.old_logprobs,
-                      sync=args.sync, seed=seed, **kw)
+                      sync=args.sync, tis_cap=args.tis_cap, seed=seed, **kw)
 
 
 def log(rec, path=None):
@@ -408,6 +408,8 @@ def main(argv=None):
     ap.add_argument("--clip", type=float, default=0.2)
     ap.add_argument("--micro-batch", type=int, default=4)
     ap.add_argument("--old-logprobs", default="trainer", choices=["trainer", "rollout"])
+    ap.add_argument("--tis-cap", type=float, default=0.0,
+                    help="truncated importance sampling cap (Yao et al. 2025; 0: off, 2 is their default)")
     ap.add_argument("--sync", default="push", choices=["push", "reload"])
     ap.add_argument("--ahead", action="store_true", help="split: generate the next batch while training")
     ap.add_argument("--partial", action="store_true", help="split: partial rollouts")

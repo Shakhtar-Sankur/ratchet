@@ -54,6 +54,8 @@ class GRPOConfig:
     scale_by_std: bool = True       # GRPO; False gives Dr. GRPO's unscaled advantages
     max_grad_norm: float = 1.0
     old_logprobs: str = "trainer"   # or "rollout"
+    tis_cap: float = 0.0            # >0: truncated importance sampling (Yao et al. 2025), each token's
+                                    # loss weighted by min(p_trainer / p_relay, tis_cap) at the old weights
     skip_zero_advantage: bool = True  # groups whose answers all scored the same teach nothing
     sync: str = "push"              # "push": update relay's backend in place; "reload": host copy + rebuild
     partial: bool = False           # stop each rollout once enough groups finished; resume the rest
@@ -72,14 +74,18 @@ def group_advantages(rewards, group_size, scale_by_std=True, eps=1e-6):
     return a.view(-1)
 
 
-def clipped_objective(new_lp, old_lp, adv, clip):
+def clipped_objective(new_lp, old_lp, adv, clip, weight=None):
     """The PPO clipped surrogate, summed over tokens (the caller divides by the token
     count of the whole batch, so micro-batches add up to a token-level mean).
-    new_lp, old_lp, adv: 1-D, one entry per response token."""
+    new_lp, old_lp, adv: 1-D, one entry per response token. weight: optional constant
+    per-token factor (truncated importance sampling)."""
     ratio = torch.exp(new_lp - old_lp)
     unclipped = ratio * adv
     clipped = torch.clamp(ratio, 1 - clip, 1 + clip) * adv
-    loss = -torch.minimum(unclipped, clipped).sum()
+    surrogate = torch.minimum(unclipped, clipped)
+    if weight is not None:
+        surrogate = surrogate * weight
+    loss = -surrogate.sum()
     with torch.no_grad():
         clipped_frac = ((unclipped > clipped) & (adv != 0)).float().sum()
     return loss, clipped_frac
@@ -203,7 +209,7 @@ class GRPO:
                 s.advantage = a
         train = [s for s in samples if s.tokens and (s.advantage != 0 or not cfg.skip_zero_advantage)]
         stats = {"loss": 0.0, "clipped": 0.0, "tokens": 0, "gap_max": 0.0, "gap_mean": 0.0, "gap_tokens": 0,
-                 "gap_over": 0}
+                 "gap_over": 0, "tis_weight": 0.0, "tis_capped": 0}
         if train:
             self._update(train, stats)
         elif self.ddp is not None:
@@ -284,6 +290,8 @@ class GRPO:
             "logprob_gap_mean": stats["gap_mean"] / max(stats["gap_tokens"], 1),
             # tokens whose importance ratio relay/trainer is outside 1 +- 0.2 at equal weights
             "logprob_gap_frac_over_0.2": stats["gap_over"] / max(stats["gap_tokens"], 1),
+            "tis_weight_mean": stats["tis_weight"] / n_tok,   # 0 when truncated IS is off
+            "tis_capped_frac": stats["tis_capped"] / n_tok,
             "time_generate": t_gen,
             "time_train": t_learn,
             "time_sync": t_sync,
@@ -299,7 +307,7 @@ class GRPO:
         # Old log-probabilities: the trainer's at the current weights, or relay's. Tokens
         # sampled with older weights always use relay's, the behaviour policy's; only
         # fresh samples measure the gap between relay and the trainer at equal weights.
-        old = []
+        old, tis = [], []
         with torch.no_grad():
             for k in range(0, len(train), cfg.micro_batch):
                 mb = train[k:k + cfg.micro_batch]
@@ -313,6 +321,13 @@ class GRPO:
                         stats["gap_tokens"] += gap.numel()
                         stats["gap_over"] += ((lp - rel).exp() - 1).abs().gt(0.2).sum().item()
                     old.append(lp if cfg.old_logprobs == "trainer" and not s.stale else rel)
+                    if cfg.tis_cap > 0:
+                        # relay sampled these tokens; weight each by how much likelier the
+                        # trainer finds it, capped (1 where the old log-probabilities are relay's)
+                        w = (old[-1] - rel).exp().clamp(max=cfg.tis_cap)
+                        stats["tis_weight"] += w.sum().item()
+                        stats["tis_capped"] += (w >= cfg.tis_cap).sum().item()
+                        tis.append(w)
         order = list(range(len(train)))
         for _ in range(cfg.epochs):
             self.rng.shuffle(order)
@@ -327,7 +342,8 @@ class GRPO:
                     new_lp = torch.cat(new)
                     old_lp = torch.cat([old[i] for i in idx])
                     adv = torch.cat([torch.full((len(s.tokens),), s.advantage, device=dev) for s in mb])
-                    loss, clipped = clipped_objective(new_lp, old_lp, adv, cfg.clip)
+                    weight = torch.cat([tis[i] for i in idx]) if tis else None
+                    loss, clipped = clipped_objective(new_lp, old_lp, adv, cfg.clip, weight)
                     (loss / total).backward()
                 stats["loss"] += loss.item() / total
                 stats["clipped"] += clipped.item()
