@@ -1,0 +1,23 @@
+== ratchet mlsys (smoke): 23305f8 kaggle_mlsys.sh: also run on Colab or one GPU (detect GPU count and architecture) | relay b452d52 | tandem 95c06d5
+0, Tesla T4, 15360 MiB, 580.82.07
+== 1 GPU(s), sm_75, colocated on 1
+== not 2 x T4: use these runs to check the setup, not in the paper
+built relay/build-cuda/librelay_c.so (CUDA, sm_75)
+== base model (evaluated once)
+{"phase": "eval", "accuracy": 0.421875, "format_rate": 0.40625, "truncated": 0.03125, "mean_tokens": 313.453125, "n": 64, "tok_per_s": 407.03530868472484}
+== fix_s1: --weight-dtype fp16 --seed 1
+{"phase": "eval", "when": "after", "mode": "colocated", "accuracy": 0.4375, "format_rate": 0.40625, "truncated": 0.0625, "mean_tokens": 315.75, "n": 64.0, "tok_per_s": 411.40612016875565}
+== nofix_s0: --weight-dtype fp32 --seed 0
+{"phase": "eval", "when": "after", "mode": "colocated", "accuracy": 0.390625, "format_rate": 0.203125, "truncated": 0.03125, "mean_tokens": 307.28125, "n": 64.0, "tok_per_s": 406.6477652288678}
+== tis_nofix: --weight-dtype fp32 --tis-cap 2
+{"phase": "eval", "when": "after", "mode": "colocated", "accuracy": 0.421875, "format_rate": 0.28125, "truncated": 0.015625, "mean_tokens": 296.125, "n": 64.0, "tok_per_s": 406.72191599993397}
+== lr1e-5_fix: --weight-dtype fp16 --lr 1e-5
+{"phase": "eval", "when": "after", "mode": "colocated", "accuracy": 0.1875, "format_rate": 0.0, "truncated": 0.0, "mean_tokens": 159.90625, "n": 64.0, "tok_per_s": 406.6416966159397}
+== summary
+run                 acc     n  gap mean  gap max    >0.2  tis w  capped reward 1-10  91-100  step s
+base               42.2    64
+fix_s1             43.8    64   0.00064    0.026   0.00%  0.000   0.00%       0.312   0.312    62.2
+lr1e-5_fix         18.8    64   0.00071    0.043   0.00%  0.000   0.00%       0.398   0.398    63.5
+nofix_s0           39.1    64   0.00913    1.151   0.71%  0.000   0.00%       0.406   0.406    67.4
+tis_nofix          42.2    64   0.00860    0.954   0.67%  1.000   0.01%       0.383   0.383    65.6
+== done: copy from '== ratchet mlsys' to here and send it back
