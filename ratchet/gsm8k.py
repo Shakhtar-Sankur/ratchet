@@ -325,7 +325,10 @@ def _colocated_rank(group, args):
         if rank == 0:
             log({"phase": "eval", "when": tag, "mode": "colocated", **summarize(tot)}, args.out)
 
-    if not args.skip_eval:
+    if rank == 0:
+        log({"phase": "config", "mode": "colocated", **{k: v for k, v in vars(args).items() if k != "phase"},
+             "trainer_weight_dtype": str(policy.weight_dtype)}, args.out)
+    if not args.skip_eval and not args.skip_eval_before:
         eval_all("before")
     train = load_problems(args.data, "train")
     t0 = time.perf_counter()
@@ -418,6 +421,8 @@ def main(argv=None):
     ap.add_argument("--eval-limit", type=int, default=0, help="test problems (0: all 1319)")
     ap.add_argument("--eval-max-new", type=int, default=512)
     ap.add_argument("--skip-eval", action="store_true")
+    ap.add_argument("--skip-eval-before", action="store_true",
+                    help="colocated: evaluate only after training (the model before is the same in every run)")
     ap.add_argument("--kv-blocks", type=int, default=3000)
     ap.add_argument("--max-batch-tokens", type=int, default=1024)
     ap.add_argument("--max-seqs", type=int, default=64)

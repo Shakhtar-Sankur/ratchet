@@ -62,3 +62,13 @@ def test_colocated_on_two_tandem_ranks(env):
     evals = [r for r in recs if r.get("phase") == "eval"]
     assert len(steps) == 3 and all(s["mode"] == "colocated" for s in steps)
     assert [e["when"] for e in evals] == ["before", "after"] and evals[0]["n"] == 12
+
+
+def test_colocated_with_truncated_is_logs_its_config_and_evaluates_only_after(env):
+    recs = run(env, "colocated", "--steps", "2", "--prompts", "4", "--world", "2", "--tis-cap", "2",
+               "--weight-dtype", "fp32", "--skip-eval-before")
+    (cfg,) = [r for r in recs if r.get("phase") == "config"]
+    assert cfg["tis_cap"] == 2 and cfg["weight_dtype"] == "fp32" and cfg["trainer_weight_dtype"] == "None"
+    steps = [r for r in recs if "step" in r]
+    assert len(steps) == 2 and all(abs(s["tis_weight_mean"] - 1) < 1e-4 for s in steps if s["trained_samples"])
+    assert [r["when"] for r in recs if r.get("phase") == "eval"] == ["after"]
