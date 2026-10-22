@@ -1,0 +1,23 @@
+== ratchet mlsys (smoke): 23305f8 kaggle_mlsys.sh: also run on Colab or one GPU (detect GPU count and architecture) | relay b452d52 | tandem 95c06d5
+0, Tesla T4, 15360 MiB, 580.178.04
+1, Tesla T4, 15360 MiB, 580.178.04
+== 2 GPU(s), sm_75, colocated on 2
+built relay/build-cuda/librelay_c.so (CUDA, sm_75)
+== base model (evaluated once)
+{"phase": "eval", "accuracy": 0.421875, "format_rate": 0.40625, "truncated": 0.03125, "mean_tokens": 313.453125, "n": 64, "tok_per_s": 587.3464788322059}
+== fix_s1: --weight-dtype fp16 --seed 1
+{"phase": "eval", "when": "after", "mode": "colocated", "accuracy": 0.421875, "format_rate": 0.25, "truncated": 0.0625, "mean_tokens": 320.875, "n": 64.0, "tok_per_s": 909.4965655918955}
+== nofix_s0: --weight-dtype fp32 --seed 0
+{"phase": "eval", "when": "after", "mode": "colocated", "accuracy": 0.4375, "format_rate": 0.0625, "truncated": 0.015625, "mean_tokens": 297.953125, "n": 64.0, "tok_per_s": 896.3841531554411}
+== tis_nofix: --weight-dtype fp32 --tis-cap 2
+{"phase": "eval", "when": "after", "mode": "colocated", "accuracy": 0.453125, "format_rate": 0.046875, "truncated": 0.046875, "mean_tokens": 306.078125, "n": 64.0, "tok_per_s": 939.160240965083}
+== lr1e-5_fix: --weight-dtype fp16 --lr 1e-5
+{"phase": "eval", "when": "after", "mode": "colocated", "accuracy": 0.375, "format_rate": 0.0, "truncated": 0.15625, "mean_tokens": 334.0625, "n": 64.0, "tok_per_s": 941.366364380856}
+== summary
+run                 acc     n  gap mean  gap max    >0.2  tis w  capped reward 1-10  91-100  step s
+base               42.2    64
+fix_s1             42.2    64   0.00062    0.030   0.00%  0.000   0.00%       0.289   0.289    29.9
+lr1e-5_fix         37.5    64   0.00070    0.030   0.00%  0.000   0.00%       0.414   0.414    32.1
+nofix_s0           43.8    64   0.01037    2.000   0.77%  0.000   0.00%       0.406   0.406    32.3
+tis_nofix          45.3    64   0.01233    1.980   0.99%  1.000   0.05%       0.438   0.438    32.7
+== done: copy from '== ratchet mlsys' to here and send it back
