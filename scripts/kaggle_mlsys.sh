@@ -1,6 +1,8 @@
 #!/bin/bash
 # Experiments for the training-inference mismatch paper, on Kaggle (Settings: Accelerator
-# "GPU T4 x2", Internet on). Every run is 100 colocated GRPO steps on GSM8K, then a greedy
+# "GPU T4 x2", Internet on). It also runs on Colab or any machine with NVIDIA GPUs: it uses two
+# GPUs when there are two, otherwise one (each step then takes about twice as long). The paper's
+# runs all use 2 x T4, so runs on other hardware are for checking only. Every run is 100 colocated GRPO steps on GSM8K, then a greedy
 # evaluation on all 1,319 test problems (the model before training is evaluated once).
 #   RUN=smoke : every configuration for 2 steps on 64 test problems (~15 min); run this first.
 #   RUN=A     : fix vs no fix, 3 seeds each (seed 0 of the fix is the published run), ~5.5 h
@@ -10,12 +12,18 @@
 # Paste everything from "== ratchet mlsys" to the end back into the chat.
 set -e
 RUN=${RUN:-smoke}
-cd /kaggle/working 2>/dev/null || cd /tmp
+WORK=/tmp; for d in /kaggle/working /content; do [ -d $d ] && WORK=$d && break; done
+cd $WORK
 rm -rf ratchet && git clone -q --recursive https://github.com/Shakhtar-Sankur/ratchet && cd ratchet
 echo "== ratchet mlsys ($RUN): $(git log -1 --format='%h %s') | relay $(git -C relay log -1 --format=%h) | tandem $(git -C tandem log -1 --format=%h)"
 nvidia-smi --query-gpu=index,name,memory.total,driver_version --format=csv,noheader
+NGPU=$(nvidia-smi -L | wc -l)
+WORLD=${WORLD:-$([ "$NGPU" -ge 2 ] && echo 2 || echo 1)}
+ARCH=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader | head -1 | tr -d .)
+echo "== $NGPU GPU(s), sm_$ARCH, colocated on $WORLD"
+[ "$WORLD" = 2 ] && [ "$ARCH" = 75 ] || echo "== not 2 x T4: use these runs to check the setup, not in the paper"
 export PATH=/usr/local/cuda/bin:$PATH
-scripts/build_relay.sh 75 2>&1 | tail -1
+scripts/build_relay.sh $ARCH 2>&1 | tail -1
 pip install -q transformers datasets huggingface_hub 2>&1 | tail -1 || true
 
 python - <<'PY'
@@ -33,7 +41,7 @@ for split in ("train", "test"):
 PY
 
 export PYTHONPATH=$PWD
-OUT=/kaggle/working/runs_$RUN; mkdir -p $OUT
+OUT=$WORK/runs_$RUN; mkdir -p $OUT
 G="python -m ratchet.gsm8k"
 COMMON="--model models/qwen --data data"
 if [ "$RUN" = smoke ]; then STEPS=2; EVAL="--eval-limit 64"; else STEPS=100; EVAL=""; fi
@@ -44,7 +52,7 @@ SHOW() { grep --line-buffered -E '"phase": "eval"|"step": [0-9]*0,' || true; }
 run() {
   local name=$1; shift
   echo "== $name: $*"
-  $G colocated $COMMON --steps $STEPS $EVAL --skip-eval-before --out $OUT/$name.jsonl "$@" 2>&1 | SHOW \
+  $G colocated $COMMON --world $WORLD --steps $STEPS $EVAL --skip-eval-before --out $OUT/$name.jsonl "$@" 2>&1 | SHOW \
     || echo "== $name FAILED (continuing)"
 }
 
